@@ -1,0 +1,36 @@
+2026-01-03 22:51:14,019 - __main__ - INFO - ==================================================
+2026-01-03 22:51:14,019 - __main__ - INFO - STARTING OPTION TRADING BOT DEMO
+2026-01-03 22:51:14,019 - __main__ - INFO - ==================================================
+2026-01-03 22:51:14,022 - __main__ - INFO - ✓ API server is healthy
+2026-01-03 22:51:14,023 - __main__ - INFO - 
+1. Searching for straddle candidates...
+2026-01-03 22:51:14,023 - __main__ - INFO - Searching straddle candidates with params: {'underlying': 'BTC', 'current_price': 45000.0, 'distance_percent': 5.0}
+2026-01-03 22:51:14,065 - __main__ - INFO - Found 0 call candidates and 0 put candidates
+2026-01-03 22:51:14,065 - __main__ - WARNING - Could not find matching call/put pair
+2026-01-03 22:54:21,067 - __main__ - INFO - ==================================================
+2026-01-03 22:54:21,067 - __main__ - INFO - STARTING OPTION TRADING BOT DEMO
+2026-01-03 22:54:21,067 - __main__ - INFO - ==================================================
+2026-01-03 22:54:21,069 - __main__ - INFO - ✓ API server is healthy
+2026-01-03 22:54:21,070 - __main__ - INFO - 
+1. Searching for straddle candidates...
+2026-01-03 22:54:21,070 - __main__ - INFO - Searching straddle candidates with params: {'underlying': 'BTC', 'current_price': 45000.0, 'distance_percent': 5.0}
+2026-01-03 22:54:21,112 - __main__ - INFO - Found 0 call candidates and 0 put candidates
+2026-01-03 22:54:21,112 - __main__ - WARNING - Could not find matching call/put pair
+2026-01-03 22:59:33,065 - __main__ - INFO - ==================================================
+2026-01-03 22:59:33,065 - __main__ - INFO - STARTING OPTION TRADING BOT DEMO
+2026-01-03 22:59:33,065 - __main__ - INFO - ==================================================
+2026-01-03 22:59:33,067 - __main__ - INFO - ✓ API server is healthy
+2026-01-03 22:59:33,067 - __main__ - INFO - 
+1. Searching for straddle candidates...
+2026-01-03 22:59:33,067 - __main__ - INFO - Searching straddle candidates with params: {'underlying': 'BTC', 'current_price': 45000.0, 'distance_percent': 5.0}
+2026-01-03 22:59:33,109 - __main__ - INFO - Found 0 call candidates and 0 put candidates
+2026-01-03 22:59:33,109 - __main__ - WARNING - Could not find matching call/put pair
+2026-01-03 23:06:24,677 - __main__ - INFO - ==================================================
+2026-01-03 23:06:24,677 - __main__ - INFO - STARTING OPTION TRADING BOT DEMO
+2026-01-03 23:06:24,677 - __main__ - INFO - ==================================================
+2026-01-03 23:06:24,679 - __main__ - INFO - ✓ API server is healthy
+2026-01-03 23:06:24,679 - __main__ - INFO - 
+1. Searching for straddle candidates...
+2026-01-03 23:06:24,679 - __main__ - INFO - Searching straddle candidates with params: {'underlying': 'BTC', 'current_price': 45000.0, 'distance_percent': 5.0}
+2026-01-03 23:06:24,721 - __main__ - INFO - Found 0 call candidates and 0 put candidates
+2026-01-03 23:06:24,721 - __main__ - WARNING - Could not find matching call/put pair
