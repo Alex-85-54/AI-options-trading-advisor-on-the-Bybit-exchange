@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sys
+import os
 from typing import Dict, List, Optional
 from datetime import datetime
 import websockets
@@ -22,7 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-API_BASE_URL = "http://localhost:8000"
+# Базовый URL API берём из переменной окружения (для Docker),
+# локально по умолчанию используется localhost.
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 
 class MonitoringService:
@@ -298,6 +301,5 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8001,  # Другой порт, чтобы не конфликтовать с api_server.py
-        reload=True
+        port=8001  # Другой порт, чтобы не конфликтовать с api_server.py
     )

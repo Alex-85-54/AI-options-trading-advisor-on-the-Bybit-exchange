@@ -1,4 +1,5 @@
-from typing import Dict, List
+from typing import Dict
+import os
 
 # Конфигурация
 CONFIG = {
@@ -8,7 +9,11 @@ CONFIG = {
     "expiration_year": "26",  # 2026
     "option_types": ["C", "P"],  # Call, Put
     "server_port": 8000,
-    "telegram_token": "6179178203:AAGV-zAG4Z3uKU1NTM8Jwcs-ILEXNI9xLOo",
+    # Токен Telegram берём из переменной окружения
+    "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
+    # Ключи Bybit (опционально, если понадобятся)
+    "bybit_api_key": os.getenv("BYBIT_API_KEY", ""),
+    "bybit_api_secret": os.getenv("BYBIT_API_SECRET", ""),
 }
 
 # Хранилище активных опционов для отслеживания

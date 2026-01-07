@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  telegram-bot:
+    build: .
+    container_name: option-telegram-bot
+    restart: unless-stopped
+    command: ["uv", "run", "telegram_bot.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN}"
+      BYBIT_API_KEY: "${BYBIT_API_KEY:-}"
+      BYBIT_API_SECRET: "${BYBIT_API_SECRET:-}"
+      # URL сервиса мониторинга внутри сети Docker
+      MONITORING_SERVICE_URL: "http://monitoring-service:8001"
+
+  api-server:
+    build: .
+    container_name: option-api-server
+    restart: unless-stopped
+    command: ["uv", "run", "api_server.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+
+  monitoring-service:
+    build: .
+    container_name: option-monitoring-service
+    restart: unless-stopped
+    command: ["uv", "run", "main.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Внутри Docker monitoring-service ходит в api-server по имени сервиса
+      API_BASE_URL: "http://api-server:8000"
+    ports:
+      - "8001:8001"
+
+

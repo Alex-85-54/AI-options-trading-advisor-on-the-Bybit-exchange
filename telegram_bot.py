@@ -27,7 +27,10 @@ if not logger.handlers:
     logger.addHandler(handler)
 
 # Конфигурация
-MONITORING_SERVICE_URL = "http://localhost:8001"
+# URL сервиса мониторинга берём из переменной окружения (для Docker),
+# локально по умолчанию используется localhost.
+import os
+MONITORING_SERVICE_URL = os.getenv("MONITORING_SERVICE_URL", "http://localhost:8001")
 THRESHOLD = 0.01  # Порог равенства цен (1%)
 CHECK_INTERVAL = 5  # Интервал проверки в секундах
 
