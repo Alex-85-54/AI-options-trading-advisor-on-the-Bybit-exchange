@@ -38,8 +38,14 @@ iv_history (symbol, timestamp, iv, ivr)
 - Обрабатывать ошибки БД без остановки работы WebSocket
 Шаг 1.3: Сборщик доски опционов
 Создать core/data/option_board.py
-Метод get_option_board(underlying, max_days=14) — получить все опционы на 1-2 недели
-Фильтрация: только OTM опционы, только активные экспирации
+Метод get_option_board(underlying, max_days=3) — получить опционы на ближайшие 3 дня
+
+Особенности:
+- Получение списка доступных экспираций с биржи (не более 3 дней)
+- Определение страйков для подписки: текущая_цена ± (500 * 7)
+- Подписка на все опционы в диапазоне (Call и Put)
+- При сохранении в БД: фильтрация только OTM опционов (ITM не сохраняются)
+- Исключение опционов с экспирацией сегодня (days_to_expiration = 0)
 Этап 2: Анализ данных (1-2 недели)
 Шаг 2.1: Анализатор истории
 Создать core/data/historical_analyzer.py
@@ -107,18 +113,164 @@ Unit тесты для анализаторов
 Настройка промптов
 5. Детали реализации
 5.1. Схема базы данных SQLite
+
+**Важно:** В базу данных сохраняются ТОЛЬКО OTM (Out of The Money) опционы. ITM и ATM опционы не сохраняются для экономии памяти.
+
 -- История опционов
-```CREATE TABLE option_history (    id INTEGER PRIMARY KEY AUTOINCREMENT,    symbol TEXT NOT NULL,    timestamp DATETIME NOT NULL,    ask_price REAL,    bid_price REAL,    mark_price REAL,    iv REAL,    delta REAL,    gamma REAL,    vega REAL,    theta REAL,    volume_24h REAL,    open_interest REAL,    underlying_price REAL,    UNIQUE(symbol, timestamp));CREATE INDEX idx_option_history_symbol ON option_history(symbol);CREATE INDEX idx_option_history_timestamp ON option_history(timestamp);-- История базовых активовCREATE TABLE underlying_history (    id INTEGER PRIMARY KEY AUTOINCREMENT,    symbol TEXT NOT NULL,    timestamp DATETIME NOT NULL,    price REAL,    UNIQUE(symbol, timestamp));-- Уровни поддержки/сопротивления (от пользователя)CREATE TABLE support_resistance_levels (    id INTEGER PRIMARY KEY AUTOINCREMENT,    underlying TEXT NOT NULL,    level_type TEXT NOT NULL, -- 'support' или 'resistance'    price REAL NOT NULL,    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,    UNIQUE(underlying, level_type, price));```
-5.2. Формат сигнала от агента
+```sql
+CREATE TABLE option_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    date_data_collection DATETIME NOT NULL,  -- дата и время сбора данных (округлено до 5 минут)
+    expiration_date DATE NOT NULL,           -- дата экспирации опциона (извлечена из symbol)
+    underlying_ticker TEXT NOT NULL,          -- базовый актив (BTC, ETH, SOL)
+    days_to_expiration INTEGER,               -- вычисляемое поле: expiration_date - date_data_collection
+    ask_price REAL,
+    bid_price REAL,
+    mark_price REAL,
+    iv REAL,                                  -- основная IV (mark_iv или ask_iv/bid_iv)
+    ask_iv REAL,
+    bid_iv REAL,
+    mark_iv REAL,
+    delta REAL,
+    gamma REAL,
+    vega REAL,
+    theta REAL,
+    volume_24h REAL,
+    open_interest REAL,
+    underlying_price REAL,
+    UNIQUE(symbol, date_data_collection)
+);
+
+-- Индексы для быстрого поиска
+CREATE INDEX idx_option_history_symbol ON option_history(symbol);
+CREATE INDEX idx_option_history_date_data_collection ON option_history(date_data_collection);
+CREATE INDEX idx_option_history_underlying_expiration ON option_history(underlying_ticker, expiration_date);
+CREATE INDEX idx_option_history_days_to_expiration ON option_history(days_to_expiration);
+CREATE INDEX idx_option_history_underlying_days ON option_history(underlying_ticker, days_to_expiration);
+```
+
+-- История базовых активов
+```sql
+CREATE TABLE underlying_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    timestamp DATETIME NOT NULL,
+    price REAL,
+    UNIQUE(symbol, timestamp)
+);
+```
+
+-- Уровни поддержки/сопротивления (от пользователя)
+```sql
+CREATE TABLE support_resistance_levels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    underlying TEXT NOT NULL,
+    level_type TEXT NOT NULL, -- 'support' или 'resistance'
+    price REAL NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(underlying, level_type, price)
+);
+```
+
+**Парсинг даты экспирации:**
+- Формат Bybit: "4JAN26" (день + месяц + год)
+- Преобразование: "4JAN26" → DATE "2026-01-08"
+- Функция `parse_expiration_date(expiry_str)` в `core/data/database.py`
+
+**Фильтрация OTM опционов:**
+- Call OTM: strike > underlying_price
+- Put OTM: strike < underlying_price
+- Проверка выполняется перед сохранением в БД
+- ITM и ATM опционы не сохраняются
+
+**Примеры запросов:**
+```sql
+-- Получить опционы с экспирацией завтра (days_to_expiration = 1)
+SELECT * FROM option_history 
+WHERE underlying_ticker = 'BTC' 
+  AND days_to_expiration = 1
+ORDER BY date_data_collection DESC;
+
+-- Получить историю опционов для анализа IVR
+SELECT * FROM option_history 
+WHERE underlying_ticker = 'BTC' 
+  AND expiration_date = '2026-01-08'
+  AND date_data_collection >= date('now', '-30 days');
+```
+
+5.2. Логика подписок на WebSocket и фильтрация опционов
+
+**Параметры подписок:**
+- Максимальный срок до экспирации: 3 дня
+- Шаг страйка для опционов до 3 дней: 500
+- Количество шагов от текущей цены: ±7 шагов
+- Фильтрация: подписываемся на все опционы в диапазоне, но сохраняем в БД только OTM
+
+**Сценарий первого запуска:**
+1. Получить список доступных экспираций с биржи (не более 3 дней от текущей даты)
+2. Для каждой экспирации:
+   - Получить текущую цену базового актива
+   - Вычислить страйки для подписки: текущая_цена ± (500 * 7)
+   - Подписаться на все опционы (Call и Put) в этом диапазоне страйков
+3. При сохранении в БД (каждые 5 минут):
+   - Проверить каждый опцион: является ли он OTM?
+   - Сохранить только OTM опционы
+   - ITM и ATM опционы игнорируются
+
+**Пример расчета страйков:**
+- Текущая цена BTC: 89,500
+- Шаг страйка: 500
+- Количество шагов: 7
+- Диапазон страйков: от 89,500 - (500 * 7) = 86,000 до 89,500 + (500 * 7) = 93,000
+- Подписка на опционы со страйками: 86000, 86500, 87000, ..., 92500, 93000
+
+**Ежедневное обновление подписок:**
+- Время обновления: 8:05 UTC (через 5 минут после добавления новых опционов на бирже в 8:00 UTC)
+- Переход суток: 8:00 UTC
+- Действия при обновлении:
+  1. Остановить сбор данных для опционов с `days_to_expiration = 0` (экспирируются сегодня)
+  2. Удалить эти опционы из активных подписок WebSocket
+  3. Получить новые опционы с биржи (если появились)
+  4. Добавить новые опционы в подписки (если соответствуют критериям: до 3 дней, в диапазоне страйков)
+  5. Пересчитать подписки для опционов с `days_to_expiration = 1, 2, 3`
+
+**Алгоритм определения OTM:**
+```python
+def is_otm(strike: float, underlying_price: float, option_type: str) -> bool:
+    """
+    Проверка: опцион OTM (Out of The Money)?
+    
+    Call OTM: strike > underlying_price
+    Put OTM: strike < underlying_price
+    
+    Returns:
+        True если опцион OTM, False если ITM или ATM
+    """
+    if option_type == 'C':
+        return strike > underlying_price
+    elif option_type == 'P':
+        return strike < underlying_price
+    return False
+```
+
+**Конфигурация подписок:**
+```python
+SUBSCRIPTION_CONFIG = {
+    "max_expiration_days": 3,              # Максимум дней до экспирации
+    "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней
+    "strike_steps_count": 7,               # ±7 шагов от текущей цены
+    "daily_update_time_utc": "08:05",      # Время обновления подписок
+    "skip_today_expiration": True,         # Пропускать опционы с экспирацией сегодня
+    "save_only_otm": True,                 # Сохранять только OTM опционы
+}
+```
+
+5.4. Формат сигнала от агента
 {    "signal_type": "strangle" | "straddle" | "call" | "put",    "underlying": "BTC",    "expiration": "4JAN26",    "strike_call": 89000,  # для strangle/straddle    "strike_put": 88000,   # для strangle/straddle    "strike": 89000,       # для направленных    "reasoning": "Низкий IVR (15%), сжатие у уровня поддержки...",    "confidence": 0.75,    # 0-1    "risk_level": "medium",    "timestamp": "2026-01-04T10:30:00"}
-5.3. Пример промпта для LLM
-Ты - эксперт по торговле опционами. Проанализируй следующие данные:Доска опционов BTC (ближайшие 1-2 недели):- Текущая цена BTC: $89,500- IVR: 15% (низкий)- Распределение греков: гамма сконцентрирована на 90k- Объем: всплеск в OTM Call на 92k- Уровень поддержки: $88,500 (от пользователя)История IV за 30 дней:- Минимум: 20%- Максимум: 85%- Текущая: 25%Новости:- [последние новости из Telegram канала]Оцени возможность входа в позицию:1. Стрэнгл (если нет дисбаланса, но есть сжатие)2. Стрэддл (если событие и IV не взлетела)3. Направленная позиция Call/Put (если явный дисбаланс)Верни JSON с решением или null если условий нет.
-6. Вопросы для уточнения
-Частота анализа агента? (5, 15, 30 минут, 1 час?)
-Какой Telegram канал для новостей? Нужен ли парсинг или достаточно подписки?
-Как пользователь будет предоставлять уровни поддержки/сопротивления? Через команду в боте или отдельный файл/API?
-Нужна ли интеграция с DeepSeek API сейчас или сначала подготовить инфраструктуру?
-Нужно ли сохранять все сигналы агента в БД для последующего анализа эффективности?
+5.5. Пример промпта для LLM
+Ты - эксперт по торговле опционами. Проанализируй следующие данные:Доска опционов BTC (ближайшие 1-2 недели):- Текущая цена BTC: $89,500- IVR: 15% (низкий)- Распределение греков: гамма сконцентрирована на 90k- Объем: всплеск в OTM Call на 92k- Уровень поддержки: $88,500 (от пользователя)История IV за 30 дней:- Минимум: 20%- Максимум: 85%- Текущая: 25%Оцени возможность входа в позицию:1. Стрэнгл (если нет дисбаланса, но есть сжатие)2. Стрэддл (если событие и IV не взлетела)3. Направленная позиция Call/Put (если явный дисбаланс)Верни JSON с решением или null если условий нет.
+
 
 7. Уточнения и дополнения (на основе ответов)
 7.1. Частота запуска агента
@@ -135,11 +287,13 @@ save_signal(signal_data) — сохранить сигнал
 get_signal_history(underlying, days=30) — получить историю сигналов
 get_signal_statistics() — статистика эффективности (win rate, avg PnL)
 update_signal_result(signal_id, result_data) — обновить результат сигнала
-7.3. Конфигурация агента и данных
+7.3. Конфигурация агента, данных и подписок
 Добавить в config.py:
-AGENT_CONFIG = {    "run_interval_minutes": 60,  # Частота запуска агента    "max_expiration_days": 14,    # Максимальная экспирация для анализа    "ivr_threshold": 25,          # Порог IVR для фильтрации    "min_confidence": 0.6,        # Минимальная уверенность для сигнала    "deepseek_api_key": os.getenv("DEEPSEEK_API_KEY", ""),    "deepseek_model": "deepseek-chat",    "deepseek_base_url": "https://api.deepseek.com",    "enable_signal_history": True,  # Сохранение истории сигналов}
+AGENT_CONFIG = {    "run_interval_minutes": 60,  # Частота запуска агента    "max_expiration_days": 3,     # Максимальная экспирация для анализа (3 дня)    "ivr_threshold": 25,          # Порог IVR для фильтрации    "min_confidence": 0.6,        # Минимальная уверенность для сигнала    "deepseek_api_key": os.getenv("DEEPSEEK_API_KEY", ""),    "deepseek_model": "deepseek-chat",    "deepseek_base_url": "https://api.deepseek.com",    "enable_signal_history": True,  # Сохранение истории сигналов}
 
-DATA_CONFIG = {    "save_interval_minutes": 5,      # Интервал сохранения данных из WebSocket в БД    "align_to_interval": True,       # Выравнивание времени сохранения по 5-минутным интервалам    "save_on_startup": True,         # Сохранить данные при старте сервиса    "batch_save": True,              # Батчинг запросов к БД (сохранять все символы за один запрос)}
+DATA_CONFIG = {    "save_interval_minutes": 5,      # Интервал сохранения данных из WebSocket в БД    "align_to_interval": True,       # Выравнивание времени сохранения по 5-минутным интервалам    "save_on_startup": True,         # Сохранить данные при старте сервиса    "batch_save": True,              # Батчинг запросов к БД (сохранять все символы за один запрос)    "save_only_otm": True,           # Сохранять только OTM опционы (ITM не сохраняются)}
+
+SUBSCRIPTION_CONFIG = {    "max_expiration_days": 3,              # Максимум дней до экспирации для подписки    "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней    "strike_steps_count": 7,               # ±7 шагов от текущей цены    "daily_update_time_utc": "08:05",      # Время обновления подписок (UTC)    "skip_today_expiration": True,         # Пропускать опционы с экспирацией сегодня    "new_options_time_utc": "08:00",      # Время добавления новых опционов на бирже (UTC)}
 7.4. Метрики эффективности
 Для анализа работы агента:
 Win Rate — процент прибыльных сигналов
@@ -215,9 +369,15 @@ def get_next_save_time(current_time):
 Особенности:
 - Сохранение происходит асинхронно, не блокирует работу WebSocket
 - При сохранении берутся последние актуальные данные из data_store для каждого символа
+- **Фильтрация OTM:** перед сохранением проверяется, является ли опцион OTM (Out of The Money)
+  - Call OTM: strike > underlying_price
+  - Put OTM: strike < underlying_price
+  - Только OTM опционы сохраняются в БД, ITM и ATM опционы игнорируются
+- При сохранении вычисляются и сохраняются дополнительные поля:
+  - `expiration_date` - извлекается из symbol (формат "4JAN26" → DATE "2026-01-08")
+  - `underlying_ticker` - извлекается из symbol (например, "BTC")
+  - `days_to_expiration` - вычисляется как expiration_date - date_data_collection
 - При ошибке сохранения - логировать, но продолжать работу
 - Первое сохранение происходит при старте сервиса (сразу или в ближайший 5-минутный интервал)
 
-Добавить в config.py:
-DATA_SAVE_INTERVAL_MINUTES = 5  # Интервал сохранения данных
-DATA_SAVE_ALIGN_TO_INTERVAL = True  # Выравнивание по 5-минутным интервалам
+**Важно:** Существующие данные в БД не мигрируются. Новая структура применяется для новых данных, начиная с момента обновления схемы БД.
