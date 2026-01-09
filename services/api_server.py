@@ -4,10 +4,16 @@ import uvicorn
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 from datetime import datetime
+import sys
+from pathlib import Path
 
-from websocket_manager import ws_manager
-from data_store import data_store
+# Добавляем корень проекта в путь для импортов
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 from config import CONFIG
+from services.websocket_manager import ws_manager
+from services.data_store import data_store
 
 app = FastAPI(title="Option Data Service", version="1.0.0")
 

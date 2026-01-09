@@ -11,9 +11,20 @@ from datetime import datetime, timedelta
 import asyncio
 import re
 
-from config import CONFIG
-from websocket_manager import ws_manager
-from data_store import data_store
+import sys
+from pathlib import Path
+
+# Добавляем корень проекта в путь для импортов
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG
+from services.websocket_manager import ws_manager
+from services.data_store import data_store
+from core.data.option_board import get_option_board
+from core.data.database import get_database
+from core.agent.decision_engine import get_decision_engine
+from core.agent.trading_agent import get_trading_agent
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Установите DEBUG для отладки
@@ -43,14 +54,17 @@ CHECK_INTERVAL = 5  # Интервал проверки в секундах
     ENTERING_STRIKE,
     CHOOSING_TYPE,
     REMOVING_OPTION,
-    WAITING_FOR_DATA
-) = range(8)
+    WAITING_FOR_DATA,
+    CHOOSING_LEVEL_TYPE,
+    ENTERING_LEVEL_PRICE,
+    REMOVING_LEVEL
+) = range(11)
 
 # Константы
 CANCEL_TEXT = "❌ Отмена"
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-UNDERLYING_ASSETS = ["BTC", "ETH", "SOL"]
+UNDERLYING_ASSETS = ["BTC"]
 
 
 class TelegramOptionBot:
@@ -60,6 +74,14 @@ class TelegramOptionBot:
         self.user_monitoring: Dict[int, bool] = {}
         self.user_jobs: Dict[int, JobQueue] = {}
         self.pair_status: Dict[int, Dict[Tuple[str, str], bool]] = {}
+        self.option_board = get_option_board()
+        
+        # Состояние агента
+        self.agent_enabled: Dict[int, bool] = {}  # Для каждого пользователя отдельно
+        self.agent_decision_engine = get_decision_engine(data_store=data_store)
+        self.agent_last_run: Dict[int, Optional[datetime]] = {}
+        self.agent_last_signal: Dict[int, Optional[Dict]] = {}
+        self.db = get_database()
 
     def _get_user_info(self, update: Update):
         """Универсальный метод для получения информации о пользователе из update"""
@@ -91,6 +113,10 @@ class TelegramOptionBot:
             [
                 InlineKeyboardButton("🗑️ Удалить опцион", callback_data="remove_option"),
                 InlineKeyboardButton("📊 Статус мониторинга", callback_data="monitoring_status")
+            ],
+            [
+                InlineKeyboardButton("🤖 Агент", callback_data="agent_status"),
+                InlineKeyboardButton("📊 Уровни S/R", callback_data="set_levels")
             ],
             [
                 InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="start_monitoring"),
@@ -144,6 +170,22 @@ class TelegramOptionBot:
             return await self.show_current_prices(update, context)
         elif action == "active_signals":  # Новый обработчик
             return await self.show_active_signals(update, context)
+        elif action == "agent_status":
+            return await self.agent_status(update, context)
+        elif action == "set_levels":
+            return await self.start_set_levels(update, context)
+        elif action == "add_level":
+            return await self.start_add_level(update, context)
+        elif action == "view_levels":
+            return await self.view_levels(update, context)
+        elif action == "remove_level":
+            return await self.start_remove_level(update, context)
+        elif action.startswith("level_underlying_"):
+            return await self.handle_level_underlying_selection(update, context)
+        elif action.startswith("level_type_"):
+            return await self.handle_level_type_selection(update, context)
+        elif action.startswith("remove_level_"):
+            return await self.handle_level_removal_selection(update, context)
         elif action == "help":
             return await self.show_help(update, context)
         elif action == "cancel":
@@ -214,7 +256,11 @@ class TelegramOptionBot:
             "/start_monitoring - Запустить мониторинг\n"
             "/stop_monitoring - Остановить мониторинг\n"
             "/monitoring_status - Статус\n"
-            "/current_prices - Текущие цены\n\n"
+            "/current_prices - Текущие цены\n"
+            "/agent_status - Статус агента\n"
+            "/agent_start - Запустить агента\n"
+            "/agent_stop - Остановить агента\n"
+            "/set_levels - Управление уровнями S/R\n\n"
             "*Как работает:*\n"
             "1. Добавьте Call и Put опционы\n"
             "2. Запустите мониторинг\n"
@@ -1294,6 +1340,796 @@ class TelegramOptionBot:
 
         return ConversationHandler.END
 
+    async def agent_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать статус агента"""
+        # Обрабатываем как callback query, так и обычное сообщение
+        if hasattr(update, 'callback_query') and update.callback_query:
+            query = update.callback_query
+            user_id = query.from_user.id
+            chat_id = query.message.chat_id
+            is_query = True
+        else:
+            query = None
+            user_id = update.effective_user.id
+            chat_id = update.message.chat_id
+            is_query = False
+        
+        is_enabled = self.agent_enabled.get(user_id, False)
+        last_run = self.agent_last_run.get(user_id)
+        last_signal = self.agent_last_signal.get(user_id)
+        
+        status_emoji = "🟢" if is_enabled else "🔴"
+        status_text = "активен" if is_enabled else "остановлен"
+        
+        message = f"🤖 *Статус торгового агента*\n\n"
+        message += f"Статус: {status_emoji} {status_text}\n"
+        
+        if last_run:
+            message += f"Последний запуск: {last_run.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        else:
+            message += f"Последний запуск: никогда\n"
+        
+        if last_signal:
+            signal_type = last_signal.get('signal_type', 'unknown')
+            confidence = last_signal.get('confidence', 0)
+            message += f"\n📊 Последний сигнал:\n"
+            message += f"Тип: {signal_type}\n"
+            message += f"Уверенность: {confidence:.0%}\n"
+            message += f"Время: {last_signal.get('timestamp', 'N/A')}\n"
+        else:
+            message += f"\n📊 Последний сигнал: нет\n"
+        
+        message += f"\n⚙️ Настройки:\n"
+        message += f"Интервал запуска: {AGENT_CONFIG.get('run_interval_minutes', 60)} мин\n"
+        message += f"Мин. уверенность: {AGENT_CONFIG.get('min_confidence', 0.6):.0%}\n"
+        message += f"Макс. экспирация: {AGENT_CONFIG.get('max_expiration_days', 3)} дней\n"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("▶️ Запустить" if not is_enabled else "⏸ Остановить", 
+                                   callback_data="agent_toggle"),
+                InlineKeyboardButton("🔄 Запустить сейчас", callback_data="agent_run_now")
+            ],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if is_query:
+            await query.edit_message_text(
+                message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+    
+    async def agent_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запустить агента"""
+        user_id = update.effective_user.id
+        chat_id = update.message.chat_id
+        
+        if self.agent_enabled.get(user_id, False):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Агент уже запущен. Используйте /agent_status для просмотра статуса."
+            )
+            return
+        
+        self.agent_enabled[user_id] = True
+        
+        # Запускаем периодический запуск агента
+        interval_minutes = AGENT_CONFIG.get("run_interval_minutes", 60)
+        
+        if context.job_queue:
+            # Удаляем старые задачи, если есть
+            current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
+            for job in current_jobs:
+                job.schedule_removal()
+            
+            # Добавляем новую задачу
+            job = context.job_queue.run_repeating(
+                self._run_agent_periodic,
+                interval=interval_minutes * 60,  # в секундах
+                first=10,  # Первый запуск через 10 секунд
+                name=f"agent_{user_id}",
+                data={'user_id': user_id, 'chat_id': chat_id}
+            )
+            logger.info(f"✅ Агент запущен для пользователя {user_id}, интервал: {interval_minutes} мин")
+        else:
+            logger.error("JobQueue not available in context")
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ *Агент запущен*\n\n"
+                 f"Агент будет анализировать рынок каждые {interval_minutes} минут.\n"
+                 f"Сигналы будут отправляться автоматически.",
+            parse_mode='Markdown'
+        )
+    
+    async def agent_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Остановить агента"""
+        user_id = update.effective_user.id
+        chat_id = update.message.chat_id
+        
+        if not self.agent_enabled.get(user_id, False):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Агент уже остановлен."
+            )
+            return
+        
+        self.agent_enabled[user_id] = False
+        
+        # Удаляем задачи из JobQueue
+        if context.job_queue:
+            current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
+            for job in current_jobs:
+                job.schedule_removal()
+            logger.info(f"⏸ Агент остановлен для пользователя {user_id}")
+        else:
+            logger.error("JobQueue not available in context")
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏸ *Агент остановлен*\n\n"
+                 "Периодический анализ рынка прекращен.",
+            parse_mode='Markdown'
+        )
+    
+    async def _run_agent_periodic(self, context: ContextTypes.DEFAULT_TYPE):
+        """Периодический запуск агента"""
+        user_id = context.job.data.get('user_id')
+        chat_id = context.job.data.get('chat_id')
+        
+        if not self.agent_enabled.get(user_id, False):
+            # Агент был остановлен, удаляем задачу
+            context.job.schedule_removal()
+            return
+        
+        # Запускаем анализ для всех активов
+        for underlying in UNDERLYING_ASSETS:
+            try:
+                logger.info(f"🤖 Запуск анализа агента для {underlying} (пользователь {user_id})")
+                decision = self.agent_decision_engine.make_decision(underlying)
+                
+                self.agent_last_run[user_id] = datetime.now()
+                
+                if decision:
+                    self.agent_last_signal[user_id] = decision
+                    await self._send_agent_signal(chat_id, decision, context)
+                else:
+                    logger.info(f"Агент не нашел подходящих условий для {underlying}")
+                    
+            except Exception as e:
+                logger.error(f"Ошибка при работе агента для {underlying}: {e}", exc_info=True)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Ошибка при анализе {underlying}: {str(e)}"
+                )
+    
+    async def _send_agent_signal(self, chat_id: int, signal: Dict, context: ContextTypes.DEFAULT_TYPE):
+        """Отправить сигнал от агента в Telegram"""
+        try:
+            message = self._format_agent_signal(signal)
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+            
+            logger.info(f"✅ Сигнал от агента отправлен в чат {chat_id}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сигнала: {e}", exc_info=True)
+    
+    def _format_agent_signal(self, signal: Dict) -> str:
+        """Форматировать сигнал от агента для отправки в Telegram"""
+        signal_type = signal.get('signal_type', 'unknown')
+        underlying = signal.get('underlying', 'BTC')
+        confidence = signal.get('confidence', 0)
+        risk_level = signal.get('risk_level', 'medium')
+        reasoning = signal.get('reasoning', '')
+        
+        # Эмодзи для типов сигналов
+        type_emojis = {
+            'strangle': '📊',
+            'straddle': '⚖️',
+            'call': '📈',
+            'put': '📉'
+        }
+        type_emoji = type_emojis.get(signal_type, '📊')
+        
+        # Эмодзи для уровня риска
+        risk_emojis = {
+            'low': '🟢',
+            'medium': '🟡',
+            'high': '🔴'
+        }
+        risk_emoji = risk_emojis.get(risk_level, '🟡')
+        
+        # Эмодзи для уверенности
+        if confidence >= 0.8:
+            conf_emoji = '🟢'
+        elif confidence >= 0.6:
+            conf_emoji = '🟡'
+        else:
+            conf_emoji = '🟠'
+        
+        message = f"{type_emoji} *Торговый сигнал от агента*\n\n"
+        message += f"*Тип позиции:* {signal_type.upper()}\n"
+        message += f"*Базовый актив:* {underlying}\n"
+        
+        # Детали опционов
+        if signal_type in ['strangle', 'straddle']:
+            strike_call = signal.get('strike_call')
+            strike_put = signal.get('strike_put')
+            if strike_call and strike_put:
+                message += f"*Страйк Call:* {strike_call:,.0f}\n"
+                message += f"*Страйк Put:* {strike_put:,.0f}\n"
+        elif signal_type in ['call', 'put']:
+            strike = signal.get('strike')
+            if strike:
+                message += f"*Страйк:* {strike:,.0f}\n"
+        
+        expiration = signal.get('expiration')
+        if expiration:
+            message += f"*Экспирация:* {expiration}\n"
+        
+        message += f"\n*Уверенность:* {conf_emoji} {confidence:.0%}\n"
+        message += f"*Уровень риска:* {risk_emoji} {risk_level}\n"
+        
+        if reasoning:
+            message += f"\n*Обоснование:*\n{reasoning}\n"
+        
+        timestamp = signal.get('timestamp')
+        if timestamp:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                message += f"\n*Время:* {dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            except:
+                message += f"\n*Время:* {timestamp}\n"
+        
+        message += f"\n⚠️ *Внимание:* Это сигнал от ИИ агента. Всегда проверяйте анализ самостоятельно!"
+        
+        return message
+    
+    async def _handle_agent_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик callback для кнопок агента"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+        
+        logger.info(f"🔔 Обработка callback агента: {query.data} (пользователь {user_id})")
+        
+        if query.data == "agent_toggle":
+            if self.agent_enabled.get(user_id, False):
+                # Останавливаем
+                self.agent_enabled[user_id] = False
+                if context.job_queue:
+                    current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
+                    for job in current_jobs:
+                        job.schedule_removal()
+                logger.info(f"⏸ Агент остановлен для пользователя {user_id}")
+                
+                # Обновляем сообщение со статусом
+                await self.agent_status(update, context)
+            else:
+                # Запускаем
+                self.agent_enabled[user_id] = True
+                interval_minutes = AGENT_CONFIG.get("run_interval_minutes", 60)
+                if context.job_queue:
+                    current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
+                    for job in current_jobs:
+                        job.schedule_removal()
+                    job = context.job_queue.run_repeating(
+                        self._run_agent_periodic,
+                        interval=interval_minutes * 60,
+                        first=10,
+                        name=f"agent_{user_id}",
+                        data={'user_id': user_id, 'chat_id': chat_id}
+                    )
+                    logger.info(f"✅ Агент запущен для пользователя {user_id}, интервал: {interval_minutes} мин")
+                else:
+                    logger.error("JobQueue not available in context")
+                
+                # Обновляем сообщение со статусом
+                await self.agent_status(update, context)
+        
+        elif query.data == "agent_run_now":
+            # Запускаем анализ немедленно
+            await query.edit_message_text("🔄 Запуск анализа...")
+            
+            try:
+                # Проверяем, что агент инициализирован
+                if not self.agent_decision_engine:
+                    logger.error("DecisionEngine не инициализирован")
+                    raise Exception("DecisionEngine не инициализирован")
+                
+                # Проверяем API ключ
+                agent = self.agent_decision_engine.agent
+                if not agent or not agent.api_key:
+                    logger.warning("DeepSeek API ключ не установлен")
+                    keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.edit_message_text(
+                        "⚠️ *Ошибка конфигурации*\n\n"
+                        "DeepSeek API ключ не установлен.\n"
+                        "Проверьте переменную окружения DEEPSEEK_API_KEY в файле .env",
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                    return
+                
+                signals_found = []
+                errors = []
+                
+                for underlying in UNDERLYING_ASSETS:
+                    try:
+                        logger.info(f"🤖 Немедленный запуск анализа агента для {underlying} (пользователь {user_id})")
+                        decision = self.agent_decision_engine.make_decision(underlying)
+                        self.agent_last_run[user_id] = datetime.now()
+                        
+                        if decision:
+                            self.agent_last_signal[user_id] = decision
+                            signals_found.append((underlying, decision))
+                            await self._send_agent_signal(chat_id, decision, context)
+                            logger.info(f"✅ Сигнал найден для {underlying}")
+                        else:
+                            logger.info(f"ℹ️ Анализ завершен для {underlying}. Подходящих условий не найдено.")
+                    except Exception as e:
+                        error_msg = f"Ошибка для {underlying}: {str(e)}"
+                        logger.error(f"Ошибка при анализе {underlying}: {e}", exc_info=True)
+                        errors.append(error_msg)
+                
+                # Формируем итоговое сообщение
+                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                if signals_found:
+                    message = f"✅ *Анализ завершен*\n\n"
+                    message += f"Найдено сигналов: {len(signals_found)}\n"
+                    for underlying, signal in signals_found:
+                        signal_type = signal.get('signal_type', 'unknown')
+                        confidence = signal.get('confidence', 0)
+                        message += f"\n• {underlying}: {signal_type} (уверенность: {confidence:.0%})"
+                    if errors:
+                        message += f"\n\n⚠️ Ошибки:\n" + "\n".join(errors)
+                elif errors:
+                    message = f"❌ *Ошибки при анализе*\n\n" + "\n".join(errors)
+                else:
+                    message = f"ℹ️ *Анализ завершен*\n\n"
+                    message += f"Подходящих условий для входа не найдено для всех активов."
+                
+                await query.edit_message_text(
+                    message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+                
+            except Exception as e:
+                logger.error(f"Ошибка при немедленном запуске агента: {e}", exc_info=True)
+                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"❌ Ошибка: {str(e)}",
+                    reply_markup=reply_markup
+                )
+        
+        # Обновляем статус после действий
+        # Не вызываем agent_status здесь, так как уже обновили сообщение через edit_message_text
+    
+    # ===== УПРАВЛЕНИЕ УРОВНЯМИ ПОДДЕРЖКИ/СОПРОТИВЛЕНИЯ =====
+    
+    async def start_set_levels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать процесс установки уровней поддержки/сопротивления"""
+        user_id, chat_id, message_id, query = self._get_user_info(update)
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("➕ Добавить уровень", callback_data="add_level"),
+                InlineKeyboardButton("📋 Просмотр уровней", callback_data="view_levels")
+            ],
+            [
+                InlineKeyboardButton("🗑️ Удалить уровень", callback_data="remove_level"),
+                InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message_text = (
+            "📊 *Управление уровнями поддержки/сопротивления*\n\n"
+            "Выберите действие:"
+        )
+        
+        if query:
+            await query.edit_message_text(
+                message_text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        
+        return CHOOSING_ACTION
+    
+    async def start_add_level(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать добавление уровня - выбор актива"""
+        user_id, chat_id, message_id, query = self._get_user_info(update)
+        
+        keyboard = []
+        for underlying in UNDERLYING_ASSETS:
+            keyboard.append([InlineKeyboardButton(
+                f"{underlying}",
+                callback_data=f"level_underlying_{underlying}"
+            )])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        message_text = "📊 *Добавление уровня*\n\nВыберите базовый актив:"
+        
+        if query:
+            await query.edit_message_text(
+                message_text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+        
+        return CHOOSING_UNDERLYING
+    
+    async def handle_level_underlying_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора актива для уровня"""
+        query = update.callback_query
+        await query.answer()
+        
+        underlying = query.data.replace("level_underlying_", "")
+        context.user_data['level_underlying'] = underlying
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🟢 Поддержка", callback_data="level_type_support"),
+                InlineKeyboardButton("🔴 Сопротивление", callback_data="level_type_resistance")
+            ],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="add_level")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"📊 *Добавление уровня для {underlying}*\n\nВыберите тип уровня:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        
+        return CHOOSING_LEVEL_TYPE
+    
+    async def handle_level_type_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора типа уровня"""
+        query = update.callback_query
+        await query.answer()
+        
+        level_type = query.data.replace("level_type_", "")
+        context.user_data['level_type'] = level_type
+        
+        level_name = "поддержки" if level_type == "support" else "сопротивления"
+        underlying = context.user_data.get('level_underlying', 'BTC')
+        
+        await query.edit_message_text(
+            f"📊 *Добавление уровня {level_name} для {underlying}*\n\n"
+            f"Введите цену уровня (число):",
+            parse_mode='Markdown'
+        )
+        
+        return ENTERING_LEVEL_PRICE
+    
+    async def handle_level_price_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода цены уровня"""
+        user_id, chat_id, message_id, query = self._get_user_info(update)
+        
+        try:
+            price = float(update.message.text.replace(',', '.'))
+            
+            underlying = context.user_data.get('level_underlying', 'BTC')
+            level_type = context.user_data.get('level_type', 'support')
+            
+            # Сохраняем уровень в БД
+            self.db.add_support_resistance_level(underlying, level_type, price)
+            
+            level_name = "поддержки" if level_type == "support" else "сопротивления"
+            emoji = "🟢" if level_type == "support" else "🔴"
+            
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить еще", callback_data="add_level")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ {emoji} Уровень {level_name} для {underlying} добавлен: *{price:,.2f}*",
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            
+            # Очищаем временные данные
+            context.user_data.pop('level_underlying', None)
+            context.user_data.pop('level_type', None)
+            
+            return CHOOSING_ACTION
+            
+        except ValueError:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Неверный формат. Введите число (например: 89500 или 89500.5)"
+            )
+            return ENTERING_LEVEL_PRICE
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении уровня: {e}", exc_info=True)
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Ошибка при добавлении уровня: {str(e)}",
+                reply_markup=reply_markup
+            )
+            return CHOOSING_ACTION
+    
+    async def view_levels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Просмотр всех уровней"""
+        user_id, chat_id, message_id, query = self._get_user_info(update)
+        
+        try:
+            all_levels = self.db.get_all_support_resistance_levels()
+            
+            if not all_levels:
+                message = "📊 *Уровни поддержки/сопротивления*\n\nУровни не установлены."
+            else:
+                message = "📊 *Уровни поддержки/сопротивления*\n\n"
+                
+                for underlying in UNDERLYING_ASSETS:
+                    if underlying in all_levels:
+                        levels = all_levels[underlying]
+                        support_levels = levels.get('support', [])
+                        resistance_levels = levels.get('resistance', [])
+                        
+                        message += f"*{underlying}:*\n"
+                        
+                        if support_levels:
+                            support_str = ", ".join([f"{p:,.2f}" for p in support_levels])
+                            message += f"🟢 Поддержка: {support_str}\n"
+                        
+                        if resistance_levels:
+                            resistance_str = ", ".join([f"{p:,.2f}" for p in resistance_levels])
+                            message += f"🔴 Сопротивление: {resistance_str}\n"
+                        
+                        message += "\n"
+            
+            keyboard = [
+                [InlineKeyboardButton("➕ Добавить уровень", callback_data="add_level")],
+                [InlineKeyboardButton("🗑️ Удалить уровень", callback_data="remove_level")],
+                [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            if query:
+                await query.edit_message_text(
+                    message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            
+            return CHOOSING_ACTION
+            
+        except Exception as e:
+            logger.error(f"Ошибка при просмотре уровней: {e}", exc_info=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Ошибка: {str(e)}"
+            )
+            return ConversationHandler.END
+    
+    async def start_remove_level(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать удаление уровня"""
+        user_id, chat_id, message_id, query = self._get_user_info(update)
+        
+        try:
+            all_levels = self.db.get_all_support_resistance_levels()
+            
+            if not all_levels:
+                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                message_text = "🗑️ *Удаление уровня*\n\nУровни не установлены."
+                
+                if query:
+                    await query.edit_message_text(
+                        message_text,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=message_text,
+                        parse_mode='Markdown',
+                        reply_markup=reply_markup
+                    )
+                return CHOOSING_ACTION
+            
+            # Создаем клавиатуру с уровнями для удаления
+            keyboard = []
+            for underlying in UNDERLYING_ASSETS:
+                if underlying in all_levels:
+                    levels = all_levels[underlying]
+                    for level_type, prices in levels.items():
+                        for price in prices:
+                            level_name = "🟢 Поддержка" if level_type == "support" else "🔴 Сопротивление"
+                            button_text = f"{underlying} {level_name} {price:,.0f}"
+                            if len(button_text) > 64:
+                                button_text = f"{underlying} {level_name[:1]} {price:,.0f}"
+                            # Используем точку как разделитель вместо подчеркивания для цены
+                            price_str = str(price).replace(".", "DOT")  # Заменяем точку на DOT
+                            callback_data = f"remove_level_{underlying}_{level_type}_{price_str}"
+                            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+            
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            message_text = "🗑️ *Удаление уровня*\n\nВыберите уровень для удаления:"
+            
+            if query:
+                await query.edit_message_text(
+                    message_text,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message_text,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            
+            return REMOVING_LEVEL
+            
+        except Exception as e:
+            logger.error(f"Ошибка при начале удаления уровня: {e}", exc_info=True)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Ошибка: {str(e)}"
+            )
+            return ConversationHandler.END
+    
+    async def handle_level_removal_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора уровня для удаления"""
+        query = update.callback_query
+        await query.answer()
+        
+        try:
+            # Парсим callback_data: remove_level_{underlying}_{level_type}_{price}
+            # Формат: remove_level_BTC_support_89500 или remove_level_BTC_support_89500DOT5
+            data_str = query.data.replace("remove_level_", "")
+            parts = data_str.split("_", 2)  # Разделяем только первые 2 части
+            underlying = parts[0]
+            level_type = parts[1]
+            price_str = parts[2] if len(parts) > 2 else ""
+            # Восстанавливаем точку из DOT
+            price = float(price_str.replace("DOT", ".").replace(",", "."))
+            
+            # Удаляем уровень из БД
+            success = self.db.remove_support_resistance_level(underlying, level_type, price)
+            
+            if success:
+                level_name = "поддержки" if level_type == "support" else "сопротивления"
+                emoji = "🟢" if level_type == "support" else "🔴"
+                
+                keyboard = [
+                    [InlineKeyboardButton("🗑️ Удалить еще", callback_data="remove_level")],
+                    [InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"✅ {emoji} Уровень {level_name} для {underlying} удален: *{price:,.2f}*",
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+            else:
+                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    "❌ Уровень не найден или уже удален.",
+                    reply_markup=reply_markup
+                )
+            
+            return CHOOSING_ACTION
+            
+        except Exception as e:
+            logger.error(f"Ошибка при удалении уровня: {e}", exc_info=True)
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="set_levels")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"❌ Ошибка: {str(e)}",
+                reply_markup=reply_markup
+            )
+            return CHOOSING_ACTION
+    
+    def _auto_subscribe_on_startup(self):
+        """
+        Автоматическая подписка на опционы при старте приложения
+        
+        Получает список доступных экспираций для базовых активов (BTC, ETH, SOL)
+        и подписывается на опционы через WebSocket согласно конфигурации.
+        """
+        logger.info("🔄 Начинаю автоматическую подписку на опционы при старте...")
+        
+        max_days = SUBSCRIPTION_CONFIG.get("max_expiration_days", 3)
+        underlying_assets = UNDERLYING_ASSETS  # ["BTC", "ETH", "SOL"]
+        
+        all_symbols = []
+        
+        for underlying in underlying_assets:
+            try:
+                logger.info(f"📊 Получение доски опционов для {underlying}...")
+                board_data = self.option_board.get_option_board(underlying, max_days=max_days)
+                
+                symbols = board_data.get('symbols', [])
+                expirations = board_data.get('expirations', [])
+                underlying_price = board_data.get('underlying_price')
+                
+                if not symbols:
+                    logger.warning(f"⚠️ Не найдено опционов для {underlying}")
+                    continue
+                
+                logger.info(
+                    f"✅ Найдено {len(symbols)} опционов для {underlying}: "
+                    f"{len(expirations)} экспираций, цена: {underlying_price}"
+                )
+                
+                all_symbols.extend(symbols)
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка при получении опционов для {underlying}: {e}", exc_info=True)
+                continue
+        
+        if not all_symbols:
+            logger.warning("⚠️ Не найдено опционов для автоматической подписки")
+            return
+        
+        # Подписываемся на все найденные опционы
+        try:
+            logger.info(f"🔌 Подписка на {len(all_symbols)} опционов через WebSocket...")
+            ws_manager.connect(all_symbols, wait_for_data=False)
+            logger.info(f"✅ Автоматическая подписка завершена: {len(all_symbols)} опционов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при подписке на опционы: {e}", exc_info=True)
+
     def run(self):
         """Запуск бота"""
         application = Application.builder().token(self.token).build()
@@ -1350,6 +2186,46 @@ class TelegramOptionBot:
                 CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
             ]
         )
+        
+        # ConversationHandler для установки уровней поддержки/сопротивления
+        set_levels_conv = ConversationHandler(
+            entry_points=[
+                CommandHandler("set_levels", self.start_set_levels),
+                CallbackQueryHandler(self.start_set_levels, pattern="^set_levels$")
+            ],
+            states={
+                CHOOSING_ACTION: [
+                    CallbackQueryHandler(self.start_add_level, pattern="^add_level$"),
+                    CallbackQueryHandler(self.view_levels, pattern="^view_levels$"),
+                    CallbackQueryHandler(self.start_remove_level, pattern="^remove_level$"),
+                    CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                ],
+                CHOOSING_UNDERLYING: [
+                    CallbackQueryHandler(self.handle_level_underlying_selection, pattern="^level_underlying_"),
+                    CallbackQueryHandler(self.start_set_levels, pattern="^set_levels$"),
+                    CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                ],
+                CHOOSING_LEVEL_TYPE: [
+                    CallbackQueryHandler(self.handle_level_type_selection, pattern="^level_type_"),
+                    CallbackQueryHandler(self.start_add_level, pattern="^add_level$"),
+                    CallbackQueryHandler(self.start_set_levels, pattern="^set_levels$"),
+                    CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                ],
+                ENTERING_LEVEL_PRICE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_level_price_input)
+                ],
+                REMOVING_LEVEL: [
+                    CallbackQueryHandler(self.handle_level_removal_selection, pattern="^remove_level_"),
+                    CallbackQueryHandler(self.start_set_levels, pattern="^set_levels$"),
+                    CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                ]
+            },
+            fallbacks=[
+                CommandHandler("cancel", self.cancel_operation),
+                CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
+                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+            ]
+        )
 
         # Основной обработчик для главного меню
         application.add_handler(CommandHandler("start", self.start))
@@ -1360,16 +2236,34 @@ class TelegramOptionBot:
         application.add_handler(CommandHandler("stop_monitoring", self.stop_monitoring_callback))
         application.add_handler(CommandHandler("current_prices", self.show_current_prices))
         application.add_handler(CommandHandler("active_signals", self.show_active_signals))
+        
+        # Команды агента
+        application.add_handler(CommandHandler("agent_status", self.agent_status))
+        application.add_handler(CommandHandler("agent_start", self.agent_start))
+        application.add_handler(CommandHandler("agent_stop", self.agent_stop))
+        
+        # Команды для уровней поддержки/сопротивления
+        application.add_handler(CommandHandler("set_levels", self.start_set_levels))
 
         # Добавляем ConversationHandler'ы
         application.add_handler(add_option_conv)
         application.add_handler(remove_option_conv)
+        application.add_handler(set_levels_conv)
 
         # Обработчик callback для кнопок главного меню
         application.add_handler(CallbackQueryHandler(self.handle_callback))
         application.add_handler(CallbackQueryHandler(self.handle_callback, pattern="^active_signals$"))
+        
+        # Обработчик callback для кнопок агента
+        application.add_handler(CallbackQueryHandler(
+            self._handle_agent_callback,
+            pattern="^(agent_toggle|agent_run_now)$"
+        ))
 
 
+        # Автоматическая подписка на опционы при старте
+        self._auto_subscribe_on_startup()
+        
         # Запускаем бота
         logger.info("Бот запущен...")
         application.run_polling(

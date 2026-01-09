@@ -14,6 +14,19 @@ from config import CONFIG, SUBSCRIPTION_CONFIG
 logger = logging.getLogger(__name__)
 
 
+def delivery_time_to_date(delivery_time_ms: int) -> date:
+    """
+    Преобразовать deliveryTime (миллисекунды Unix) в date
+    
+    Args:
+        delivery_time_ms: Время экспирации в миллисекундах
+        
+    Returns:
+        Объект date
+    """
+    return datetime.fromtimestamp(delivery_time_ms / 1000).date()
+
+
 def parse_expiration_date(expiry_str: str) -> Optional[date]:
     """
     Парсинг даты экспирации из формата Bybit
@@ -110,6 +123,38 @@ class OptionBoard:
         )
         self.config = SUBSCRIPTION_CONFIG
     
+    def _get_underlying_price(self, underlying: str) -> Optional[float]:
+        """
+        Получить текущую цену базового актива
+        
+        Args:
+            underlying: Базовый актив (например, 'BTC', 'ETH', 'SOL')
+            
+        Returns:
+            Цена базового актива или None
+        """
+        try:
+            # Получаем цену через спотовый рынок
+            ticker_symbol = f"{underlying}USDT"
+            response = self.http_client.get_tickers(category="spot", symbol=ticker_symbol)
+            
+            if response.get("retCode") == 0:
+                result = response.get("result", {})
+                list_data = result.get("list", [])
+                if list_data and len(list_data) > 0:
+                    last_price = list_data[0].get("lastPrice")
+                    if last_price:
+                        price = float(last_price)
+                        logger.info(f"💰 Цена {underlying}: {price}")
+                        return price
+            
+            logger.warning(f"Не удалось получить цену {underlying} через spot API")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении цены {underlying}: {e}", exc_info=True)
+            return None
+
     def get_option_board(self, underlying: str, max_days: int = 3) -> Dict[str, List[str]]:
         """
         Получить доску опционов для подписки
@@ -130,96 +175,33 @@ class OptionBoard:
                 - 'underlying_price': текущая цена базового актива
         """
         try:
-            # Получаем список всех опционов с биржи
-            logger.info(f"Получение списка опционов для {underlying}...")
-            response = self.http_client.get_instruments_info(category="option")
+            # Получаем текущую цену базового актива
+            underlying_price = self._get_underlying_price(underlying)
+            if underlying_price is None:
+                logger.error(f"❌ Не удалось получить цену базового актива {underlying}")
+                return {
+                    'symbols': [],
+                    'expirations': [],
+                    'strikes': [],
+                    'underlying_price': None
+                }
+            
+            # Получаем список опционов с фильтрацией по базовому активу
+            logger.info(f"📡 Запрос списка опционов для {underlying} через Bybit API...")
+            response = self.http_client.get_instruments_info(
+                category="option",
+                status="Trading",
+                baseCoin=underlying,
+                settleCoin="USDT",
+                limit=1000
+            )
+            
+            logger.debug(f"Ответ API: retCode={response.get('retCode')}, retMsg={response.get('retMsg')}")
             
             if response.get("retCode") != 0:
-                logger.error(f"Ошибка при получении опционов: {response.get('retMsg')}")
-                return {
-                    'symbols': [],
-                    'expirations': [],
-                    'strikes': [],
-                    'underlying_price': None
-                }
-            
-            instruments = response.get("result", {}).get("list", [])
-            if not instruments:
-                logger.warning(f"Не найдено опционов для {underlying}")
-                return {
-                    'symbols': [],
-                    'expirations': [],
-                    'strikes': [],
-                    'underlying_price': None
-                }
-            
-            # Фильтруем опционы по базовому активу
-            underlying_options = [
-                inst for inst in instruments
-                if inst.get("symbol", "").startswith(underlying + "-")
-            ]
-            
-            if not underlying_options:
-                logger.warning(f"Не найдено опционов для базового актива {underlying}")
-                return {
-                    'symbols': [],
-                    'expirations': [],
-                    'strikes': [],
-                    'underlying_price': None
-                }
-            
-            # Получаем текущую цену базового актива (берем из первого опциона)
-            underlying_price = None
-            for option in underlying_options:
-                price = option.get("underlyingPrice")
-                if price and price > 0:
-                    underlying_price = float(price)
-                    break
-            
-            if underlying_price is None:
-                logger.error(f"Не удалось получить цену базового актива {underlying}")
-                return {
-                    'symbols': [],
-                    'expirations': [],
-                    'strikes': [],
-                    'underlying_price': None
-                }
-            
-            logger.info(f"Текущая цена {underlying}: {underlying_price}")
-            
-            # Получаем уникальные экспирации и фильтруем по max_days
-            current_date = date.today()
-            valid_expirations: Set[str] = set()
-            expiration_dates: Dict[str, date] = {}  # expiry_str -> date
-            
-            for option in underlying_options:
-                symbol = option.get("symbol", "")
-                # Парсим символ: BTC-4JAN26-89000-C-USDT
-                parts = symbol.split("-")
-                if len(parts) < 5:
-                    continue
-                
-                expiry_str = parts[1]  # "4JAN26"
-                exp_date = parse_expiration_date(expiry_str)
-                
-                if exp_date is None:
-                    continue
-                
-                days_to_exp = calculate_days_to_expiration(exp_date, current_date)
-                
-                # Исключаем опционы с экспирацией сегодня (days_to_expiration = 0)
-                if self.config.get("skip_today_expiration", True) and days_to_exp == 0:
-                    continue
-                
-                # Фильтруем по max_days
-                if days_to_exp > max_days:
-                    continue
-                
-                valid_expirations.add(expiry_str)
-                expiration_dates[expiry_str] = exp_date
-            
-            if not valid_expirations:
-                logger.warning(f"Не найдено валидных экспираций для {underlying} (max_days={max_days})")
+                error_msg = response.get('retMsg', 'Unknown error')
+                logger.error(f"❌ Ошибка при получении опционов: {error_msg}")
+                logger.error(f"Полный ответ API: {response}")
                 return {
                     'symbols': [],
                     'expirations': [],
@@ -227,13 +209,26 @@ class OptionBoard:
                     'underlying_price': underlying_price
                 }
             
-            logger.info(f"Найдено {len(valid_expirations)} валидных экспираций: {sorted(valid_expirations)}")
+            instruments = response.get("result", {}).get("list", [])
+            logger.info(f"📦 Получено {len(instruments)} инструментов от API")
             
-            # Определяем страйки для подписки: текущая_цена ± (500 * 7)
+            if not instruments:
+                logger.warning(f"⚠️ Не найдено опционов для {underlying}")
+                return {
+                    'symbols': [],
+                    'expirations': [],
+                    'strikes': [],
+                    'underlying_price': underlying_price
+                }
+            
+            # Фильтруем опционы по дате экспирации и страйкам
+            current_date = date.today()
+            max_expiration_date = current_date + timedelta(days=max_days)
+            
+            # Определяем диапазон страйков для подписки
             strike_step = self.config.get("strike_step_3days", 500)
             strike_steps_count = self.config.get("strike_steps_count", 7)
             
-            # Вычисляем диапазон страйков
             min_strike = underlying_price - (strike_step * strike_steps_count)
             max_strike = underlying_price + (strike_step * strike_steps_count)
             
@@ -241,57 +236,93 @@ class OptionBoard:
             min_strike = int(min_strike // strike_step) * strike_step
             max_strike = int((max_strike // strike_step) + 1) * strike_step
             
-            logger.info(f"Диапазон страйков для подписки: {min_strike} - {max_strike} (шаг: {strike_step})")
+            logger.info(f"🎯 Диапазон страйков: {min_strike} - {max_strike} (шаг: {strike_step})")
+            logger.info(f"📅 Фильтр по дате: до {max_expiration_date} (max_days={max_days})")
             
-            # Собираем символы опционов для подписки
+            # Собираем валидные опционы
             symbols_to_subscribe: List[str] = []
             strikes_set: Set[int] = set()
+            expiration_dates_set: Set[date] = set()
+            expiration_strings_set: Set[str] = set()
             
-            for option in underlying_options:
+            skip_today = self.config.get("skip_today_expiration", True)
+            
+            for option in instruments:
                 symbol = option.get("symbol", "")
-                parts = symbol.split("-")
+                delivery_time_ms = option.get("deliveryTime")
                 
+                if not symbol or not delivery_time_ms:
+                    continue
+                
+                # Парсим символ для получения страйка
+                parts = symbol.split("-")
                 if len(parts) < 5:
                     continue
                 
-                expiry_str = parts[1]
-                strike_str = parts[2]
-                option_type = parts[3]  # 'C' или 'P'
-                
-                # Проверяем, что экспирация валидна
-                if expiry_str not in valid_expirations:
-                    continue
-                
                 try:
-                    strike = int(strike_str)
-                except ValueError:
+                    strike = int(parts[2])
+                except (ValueError, IndexError):
                     continue
                 
-                # Проверяем, что страйк в диапазоне
+                # Проверяем страйк
                 if strike < min_strike or strike > max_strike:
                     continue
                 
-                # Добавляем символ для подписки (Call и Put)
-                symbols_to_subscribe.append(symbol)
-                strikes_set.add(strike)
+                # Проверяем дату экспирации через deliveryTime
+                try:
+                    expiration_date = delivery_time_to_date(int(delivery_time_ms))
+                    days_to_exp = calculate_days_to_expiration(expiration_date, current_date)
+                    
+                    # Исключаем опционы с экспирацией сегодня
+                    if skip_today and days_to_exp == 0:
+                        continue
+                    
+                    # Фильтруем по max_days
+                    if days_to_exp > max_days:
+                        continue
+                    
+                    # Добавляем символ для подписки
+                    symbols_to_subscribe.append(symbol)
+                    strikes_set.add(strike)
+                    expiration_dates_set.add(expiration_date)
+                    
+                    # Сохраняем строковое представление экспирации для совместимости
+                    expiry_str = parts[1]  # "4JAN26"
+                    expiration_strings_set.add(expiry_str)
+                    
+                except (ValueError, TypeError) as e:
+                    logger.debug(f"Ошибка при обработке deliveryTime для {symbol}: {e}")
+                    continue
             
-            # Сортируем страйки
+            if not symbols_to_subscribe:
+                logger.warning(
+                    f"⚠️ Не найдено валидных опционов для {underlying} "
+                    f"(max_days={max_days}, страйки {min_strike}-{max_strike})"
+                )
+                return {
+                    'symbols': [],
+                    'expirations': [],
+                    'strikes': [],
+                    'underlying_price': underlying_price
+                }
+            
             strikes_list = sorted(strikes_set)
+            expirations_list = sorted(expiration_strings_set)
             
             logger.info(
-                f"Подготовлено {len(symbols_to_subscribe)} символов для подписки "
-                f"({len(valid_expirations)} экспираций, {len(strikes_list)} страйков)"
+                f"✅ Подготовлено {len(symbols_to_subscribe)} символов для подписки: "
+                f"{len(expirations_list)} экспираций, {len(strikes_list)} страйков"
             )
             
             return {
                 'symbols': symbols_to_subscribe,
-                'expirations': sorted(valid_expirations),
+                'expirations': expirations_list,
                 'strikes': strikes_list,
                 'underlying_price': underlying_price
             }
             
         except Exception as e:
-            logger.error(f"Ошибка при получении доски опционов для {underlying}: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка при получении доски опционов для {underlying}: {e}", exc_info=True)
             return {
                 'symbols': [],
                 'expirations': [],

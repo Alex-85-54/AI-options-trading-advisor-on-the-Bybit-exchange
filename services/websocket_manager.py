@@ -1,6 +1,13 @@
 from pybit.unified_trading import WebSocket
-from config import CONFIG
-from data_store import data_store
+import sys
+from pathlib import Path
+
+# Добавляем корень проекта в путь для импортов
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from config import CONFIG, DATA_CONFIG
+from services.data_store import data_store
 import logging
 import json
 from typing import List
@@ -189,6 +196,17 @@ class OptionWebSocketManager:
                 self.active_symbols.update(symbols)
                 self.is_connected = True
                 logger.info(f"✅ WebSocket connected for {len(symbols)} symbols")
+                
+                # Запускаем периодическое сохранение данных в БД
+                if DATA_CONFIG.get("save_interval_minutes"):
+                    try:
+                        data_store.start_periodic_save(
+                            interval_minutes=DATA_CONFIG["save_interval_minutes"],
+                            align_to_interval=DATA_CONFIG.get("align_to_interval", True)
+                        )
+                        logger.info("Периодическое сохранение данных в БД запущено")
+                    except Exception as e:
+                        logger.error(f"Ошибка при запуске периодического сохранения: {e}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"❌ Failed to connect WebSocket: {e}")

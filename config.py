@@ -40,3 +40,42 @@ SUBSCRIPTION_CONFIG = {
     "new_options_time_utc": "08:00",       # Время добавления новых опционов на бирже (UTC)
     "save_only_otm": True,                 # Сохранять только OTM опционы
 }
+
+# Конфигурация анализа исторических данных
+ANALYSIS_CONFIG = {
+    "iv_analysis_days": 30,                # Количество дней истории для анализа IV (процентили, IVR)
+    "greeks_analysis_days": 3,             # Количество дней истории для анализа тренда греков
+}
+
+# Конфигурация стратегий анализа
+STRATEGY_CONFIG = {
+    # IV Filter
+    "ivr_threshold": 25.0,                 # Порог IVR для фильтрации (опционы с IVR < threshold считаются подходящими)
+    
+    # Greeks Analyzer
+    "gamma_concentration_threshold": 0.3,  # Порог концентрации гаммы (доля гаммы в узком диапазоне страйков)
+    "vega_concentration_threshold": 0.3,  # Порог концентрации веги
+    "skew_threshold": 0.1,                 # Порог скью для обнаружения асимметрии (абсолютное значение)
+    
+    # Anomaly Detector
+    "volume_spike_multiplier": 2.0,        # Множитель для обнаружения всплеска объема (средний объем * multiplier)
+    "delta_imbalance_threshold": 0.2,      # Порог дисбаланса дельты (разница между Call и Put дельтами)
+}
+
+# Конфигурация LLM агента
+AGENT_CONFIG = {
+    "run_interval_minutes": 60,            # Частота запуска агента (каждый час)
+    "run_at_hour_start": True,             # Запускать в начале каждого часа (10:00, 11:00, ...)
+    "max_expiration_days": 3,              # Максимальная экспирация для анализа (3 дня)
+    "ivr_threshold": 25,                   # Порог IVR для фильтрации
+    "min_confidence": 0.6,                 # Минимальная уверенность для сигнала
+    "deepseek_api_key": os.getenv("DEEPSEEK_API_KEY", ""),
+    "deepseek_model": "deepseek-chat",
+    "deepseek_base_url": "https://api.deepseek.com",
+    "enable_signal_history": True,         # Сохранение истории сигналов
+    # Обработка ошибок и retry
+    "api_retry_attempts": 3,               # Количество попыток повтора при ошибке API
+    "api_retry_delay_seconds": 2,          # Начальная задержка между попытками (секунды)
+    "api_timeout_seconds": 30,            # Таймаут для API запросов (секунды)
+    "skip_on_api_error": True,            # Пропускать цикл при недоступности API (не падать)
+}
