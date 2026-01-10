@@ -15,16 +15,10 @@ from datetime import datetime, timedelta
 import pandas as pd
 import time
 from typing import Set
+from utils.logging_config import setup_service_logging
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Установите DEBUG вместо INFO
-
-# Добавьте handler если еще нет
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
+# Настройка логирования с ротацией файлов (INFO вместо DEBUG чтобы не перегружать логи)
+logger = setup_service_logging(service_name="websocket_manager", log_level=logging.WARNING)
 
 class OptionWebSocketManager:
     """Менеджер WebSocket подключений"""
@@ -63,7 +57,7 @@ class OptionWebSocketManager:
     def handle_message(self, message):
         """Обработчик сообщений от WebSocket"""
         try:
-            logger.info(f"📨 Received WebSocket message")
+            logger.debug(f"📨 Received WebSocket message")
 
             # Если это dict, используем как есть
             if isinstance(message, dict):
@@ -85,7 +79,7 @@ class OptionWebSocketManager:
             # Теперь обрабатываем data
             if 'topic' in data and 'data' in data:
                 symbol = data['topic'].split('.')[-1]
-                logger.info(f"Processing data for symbol: {symbol}")
+                logger.debug(f"Processing data for symbol: {symbol}")
 
                 # data['data'] - это словарь, а не список!
                 data_item = data['data']
@@ -151,7 +145,7 @@ class OptionWebSocketManager:
             }
 
             # Логируем полученные данные
-            logger.info(f"Data for {symbol}: ask={option_data['ask_price']}, bid={option_data['bid_price']}")
+            logger.debug(f"Data for {symbol}: ask={option_data['ask_price']}, bid={option_data['bid_price']}")
 
             # Сохраняем в хранилище
             data_store.update(symbol, option_data)
@@ -182,9 +176,9 @@ class OptionWebSocketManager:
                     restart_on_error=CONFIG["restart_on_error"],
                 )
 
-                # Включим логирование pybit для отладки
+                # Отключаем DEBUG логирование pybit (слишком много логов)
                 import logging as pybit_logging
-                pybit_logging.getLogger("pybit").setLevel(logging.DEBUG)
+                pybit_logging.getLogger("pybit").setLevel(logging.WARNING)
 
                 logger.info(f"Subscribing to symbols: {symbols}")
 

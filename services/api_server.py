@@ -263,14 +263,7 @@ async def get_strategy_config():
 async def get_application_status():
     """Получить текущее состояние приложения"""
     try:
-        # Статус WebSocket менеджера
-        ws_status = {
-            "connected": ws_manager.is_connected,
-            "active_symbols_count": len(ws_manager.active_symbols),
-            "active_symbols": list(ws_manager.active_symbols)[:50]  # Первые 50 для просмотра
-        }
-        
-        # Статус data_store
+        # Статус data_store - получаем данные сначала
         all_data = data_store.get_all()
         last_update = None
         if all_data:
@@ -288,6 +281,23 @@ async def get_application_status():
             "last_update": last_update.isoformat() if last_update else None
         }
         
+        # Статус WebSocket менеджера - проверяем не только is_connected, но и наличие ws и активных символов
+        # WebSocket считается подключенным, если:
+        # 1. is_connected = True, ИЛИ
+        # 2. есть ws объект и активные символы, ИЛИ
+        # 3. есть данные в data_store (значит WebSocket работает, даже если статус не обновлен)
+        has_ws_object = ws_manager.ws is not None
+        has_active_symbols = len(ws_manager.active_symbols) > 0
+        has_data_in_store = len(all_data) > 0  # Если есть данные, значит WebSocket работал
+        
+        ws_connected = ws_manager.is_connected or (has_ws_object and has_active_symbols) or has_data_in_store
+        
+        ws_status = {
+            "connected": ws_connected,
+            "active_symbols_count": len(ws_manager.active_symbols),
+            "active_symbols": list(ws_manager.active_symbols)[:50]  # Первые 50 для просмотра
+        }
+        
         # Общий статус
         return {
             "status": "running",
@@ -296,11 +306,11 @@ async def get_application_status():
             "data_store": store_stats,
             "services": {
                 "api_server": "running",
-                "websocket_manager": "connected" if ws_manager.is_connected else "disconnected"
+                "websocket_manager": "connected" if ws_connected else "disconnected"
             }
         }
     except Exception as e:
-        logger.error(f"Error getting application status: {e}")
+        logger.error(f"Error getting application status: {e}", exc_info=True)
         return {
             "status": "error",
             "error": str(e),
@@ -314,10 +324,34 @@ async def get_database_stats():
     try:
         db = get_database()
         stats = db.get_database_statistics()
-        return stats
+        # Убеждаемся, что все ожидаемые поля присутствуют
+        result = {
+            'option_history': stats.get('option_history', 0),
+            'underlying_history': stats.get('underlying_history', 0),
+            'iv_history': stats.get('iv_history', 0),
+            'support_resistance_levels': stats.get('support_resistance_levels', 0),
+            'agent_signals': stats.get('agent_signals', 0),  # Используем правильное имя
+            'signal_results': stats.get('signal_results', 0),
+            'total': stats.get('total', 0),
+            'db_size_mb': stats.get('db_size_mb', 0.0),
+            'last_update': stats.get('last_update')
+        }
+        return result
     except Exception as e:
-        logger.error(f"Error getting database stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting database stats: {e}", exc_info=True)
+        # Возвращаем пустую статистику вместо ошибки, чтобы админ-панель не падала
+        return {
+            'option_history': 0,
+            'underlying_history': 0,
+            'iv_history': 0,
+            'support_resistance_levels': 0,
+            'agent_signals': 0,
+            'signal_results': 0,
+            'total': 0,
+            'db_size_mb': 0.0,
+            'last_update': None,
+            'error': str(e)
+        }
 
 
 @app.get("/admin/api/services")
@@ -329,8 +363,8 @@ async def get_services_status():
     services = {
         "api_server": {
             "status": "running",
-            "port": CONFIG["server_port"],
-            "url": f"http://localhost:{CONFIG['server_port']}"
+            "port": 7000,  # Порт внутри контейнера
+            "url": f"http://localhost:8000"  # Порт на хосте
         },
         "monitoring_service": {
             "status": "unknown",
@@ -339,14 +373,27 @@ async def get_services_status():
         }
     }
     
-    # Проверяем monitoring service
+    # Проверяем monitoring service - внутри Docker используем имя сервиса
     try:
-        monitoring_url = os.getenv("MONITORING_SERVICE_URL", "http://localhost:8001")
-        response = requests.get(f"{monitoring_url}/health", timeout=2)
-        if response.status_code == 200:
-            services["monitoring_service"]["status"] = "running"
-        else:
-            services["monitoring_service"]["status"] = "error"
+        # Сначала пробуем через имя сервиса (внутри Docker сети)
+        monitoring_url = os.getenv("MONITORING_SERVICE_URL", "http://monitoring-service:8001")
+        try:
+            response = requests.get(f"{monitoring_url}/health", timeout=2)
+            if response.status_code == 200:
+                services["monitoring_service"]["status"] = "running"
+            else:
+                services["monitoring_service"]["status"] = "error"
+        except requests.exceptions.RequestException:
+            # Если не получилось через имя сервиса, пробуем localhost (для внешнего доступа)
+            try:
+                response = requests.get("http://localhost:8001/health", timeout=2)
+                if response.status_code == 200:
+                    services["monitoring_service"]["status"] = "running"
+                else:
+                    services["monitoring_service"]["status"] = "error"
+            except requests.exceptions.RequestException as e:
+                services["monitoring_service"]["status"] = "unavailable"
+                services["monitoring_service"]["error"] = str(e)
     except Exception as e:
         services["monitoring_service"]["status"] = "unavailable"
         services["monitoring_service"]["error"] = str(e)
@@ -358,15 +405,25 @@ async def get_services_status():
 async def get_logs(limit: int = 100, level: Optional[str] = None, logger_name: Optional[str] = None):
     """Получить логи из буфера"""
     try:
-        logs = log_buffer.get_logs(limit=limit, level=level, logger_name=logger_name)
+        # Исключаем логи websocket_manager (слишком много)
+        logs = log_buffer.get_logs(limit=limit * 2, level=level, logger_name=logger_name)
+        # Фильтруем логи websocket_manager (кроме ошибок)
+        filtered_logs = [
+            log for log in logs 
+            if 'websocket_manager' not in log.get('logger', '').lower() 
+            or log.get('level') == 'ERROR'
+        ]
+        # Берем только нужное количество
+        filtered_logs = filtered_logs[-limit:] if len(filtered_logs) > limit else filtered_logs
+        
         counts = log_buffer.count_by_level()
         return {
-            "logs": logs,
-            "total": len(logs),
+            "logs": filtered_logs,
+            "total": len(filtered_logs),
             "counts_by_level": counts
         }
     except Exception as e:
-        logger.error(f"Error getting logs: {e}")
+        logger.error(f"Error getting logs: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -377,38 +434,57 @@ async def websocket_logs(websocket: WebSocket):
     logger.info("WebSocket connection for logs established")
     
     try:
-        # Отправляем последние 100 логов при подключении
-        initial_logs = log_buffer.get_logs(limit=100)
+        # Отправляем последние 100 логов при подключении (исключая websocket_manager)
+        all_logs = log_buffer.get_logs(limit=200)  # Берем больше, чтобы после фильтрации было достаточно
+        filtered_logs = [
+            log for log in all_logs 
+            if 'websocket_manager' not in log.get('logger', '').lower() 
+            or log.get('level') == 'ERROR'
+        ]
+        initial_logs = filtered_logs[-100:] if len(filtered_logs) > 100 else filtered_logs
+        
         await websocket.send_text(json.dumps({
             "type": "initial",
             "logs": initial_logs
-        }))
+        }, default=str))
         
         # Отслеживаем новые логи (простое решение - опрос каждые 0.5 секунды)
-        last_count = len(log_buffer.logs)
+        last_logs_count = len(log_buffer.logs)
+        heartbeat_counter = 0  # Счетчик для heartbeat (каждые 10 итераций = 5 секунд)
         while True:
             await asyncio.sleep(0.5)  # Проверяем каждые 0.5 секунды
             
-            current_count = len(log_buffer.logs)
-            if current_count > last_count:
-                # Есть новые логи - отправляем последние
-                new_logs = log_buffer.get_logs(limit=current_count - last_count)
-                await websocket.send_text(json.dumps({
-                    "type": "update",
-                    "logs": new_logs
-                }))
-                last_count = current_count
+            current_logs_count = len(log_buffer.logs)
+            if current_logs_count > last_logs_count:
+                # Есть новые логи - получаем последние и фильтруем
+                new_logs = log_buffer.get_logs(limit=current_logs_count - last_logs_count)
+                filtered_new_logs = [
+                    log for log in new_logs 
+                    if 'websocket_manager' not in log.get('logger', '').lower() 
+                    or log.get('level') == 'ERROR'
+                ]
+                
+                if filtered_new_logs:
+                    await websocket.send_text(json.dumps({
+                        "type": "update",
+                        "logs": filtered_new_logs
+                    }, default=str))
+                
+                last_logs_count = current_logs_count
             
-            # Периодически отправляем heartbeat
-            await websocket.send_text(json.dumps({
-                "type": "heartbeat",
-                "timestamp": datetime.now().isoformat()
-            }))
+            # Периодически отправляем heartbeat (каждые 5 секунд = 10 итераций)
+            heartbeat_counter += 1
+            if heartbeat_counter >= 10:
+                heartbeat_counter = 0
+                await websocket.send_text(json.dumps({
+                    "type": "heartbeat",
+                    "timestamp": datetime.now().isoformat()
+                }, default=str))
             
     except WebSocketDisconnect:
         logger.info("WebSocket connection for logs disconnected")
     except Exception as e:
-        logger.error(f"Error in WebSocket logs: {e}")
+        logger.error(f"Error in WebSocket logs: {e}", exc_info=True)
         try:
             await websocket.close()
         except:
