@@ -24,12 +24,14 @@ services:
     build: .
     container_name: option-api-server
     restart: unless-stopped
-    command: ["uv", "run", "./services/api_server.py"]
+    command: ["uv", "run", "uvicorn", "services.api_server:app", "--host", "0.0.0.0", "--port", "7000", "--log-level", "info"]
     environment:
       PYTHONUNBUFFERED: "1"
     ports:
-      - "8000:8000"
+      - "8000:7000"  # Хост:Контейнер - сервер внутри контейнера слушает на 7000
     volumes:
+      # Монтируем код для разработки (изменения применяются без пересборки)
+      - .:/app
       # Монтируем директорию logs для доступа к логам извне контейнера
       - ./logs:/app/logs
       # Монтируем директорию static для админ-панели

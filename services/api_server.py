@@ -416,21 +416,31 @@ async def websocket_logs(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    print(f"✓ Starting API server on port {CONFIG['server_port']}...", flush=True)
+    # Используем порт из конфига или дефолтный 7000
+    server_port = 7000  # Хардкод порта
+    print(f"✓ Starting API server on port {server_port}...", flush=True)
     print(f"✓ Static directory: {static_dir.absolute()}", flush=True)
     print(f"✓ Admin HTML exists: {(static_dir / 'admin.html').exists()}", flush=True)
-    logger.info(f"Starting API server on {CONFIG['server_port']}...")
+    logger.info(f"Starting API server on port {server_port}...")
     logger.info(f"Static directory: {static_dir.absolute()}")
     logger.info(f"Admin HTML exists: {(static_dir / 'admin.html').exists()}")
     try:
-        print(f"✓ Starting uvicorn...", flush=True)
+        print(f"✓ Starting uvicorn on port {server_port}...", flush=True)
+        print(f"✓ Host: 0.0.0.0, Port: {server_port}", flush=True)
+        # Используем объект app напрямую - это надежнее чем строка с путем
         uvicorn.run(
-            "api_server:app",
+            app,  # Используем объект app напрямую
             host="0.0.0.0",
-            port=7000,
-            log_level="info"
+            port=server_port,
+            log_level="info",
+            access_log=True,
+            loop="asyncio"
         )
+        # Эта строка не выполнится, так как uvicorn.run() блокирует выполнение
+        print("✓ Uvicorn server started successfully", flush=True)
     except Exception as e:
         print(f"✗ Error starting server: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         logger.error(f"Error starting server: {e}", exc_info=True)
         raise
