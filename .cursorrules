@@ -1,0 +1,78 @@
+# Option Trading Bot (Bybit + Telegram) - Project Rules
+
+## Project Overview
+Торговый советник по опционам на Bybit с LLM агентом (DeepSeek). Бот помогает входить в опционные позиции (Стрэнгл, Стрэддл, направленные) через Telegram интерфейс. Мониторит равенство цен Call/Put для сигналов входа.
+
+**Ключевые документы для контекста:**
+- `NOTES.md` - краткое описание проекта, архитектура сервисов, Docker setup
+- `ARCHITECTURE.md` - детальная архитектура, план разработки, схема БД
+
+## Tech Stack
+- **Python**: 3.12+
+- **Package Manager**: `uv` (используй `uv run` для запуска, `uv sync` для установки зависимостей)
+- **Deployment**: Docker Compose (3 сервиса: telegram-bot, api-server, monitoring-service)
+- **Key Libraries**: 
+  - `python-telegram-bot` для Telegram бота
+  - `fastapi` + `uvicorn` для API сервисов
+  - `pybit` для WebSocket подключения к Bybit
+  - `pandas` для работы с данными
+
+## Project Structure
+core/
+├── agent/ # LLM агент (DeepSeek) - trading_agent.py, decision_engine.py, prompt_templates.py
+├── data/ # Работа с данными - database.py (SQLite), data_collector.py, option_board.py, historical_analyzer.py
+└── strategy/ # Торговые стратегии - iv_filter.py, greeks_analyzer.py, anomaly_detector.py, position_builder.py
+services/
+├── telegram_bot.py # Telegram бот (основной интерфейс пользователя)
+├── api_server.py # FastAPI сервис данных опционов (порт 8000)
+├── websocket_manager.py # Менеджер WebSocket подключений к Bybit
+└── data_store.py # In-memory хранилище последних котировок
+
+
+## Key Concepts
+
+### Option Trading Logic
+- **Стрэнгл/Стрэддл**: Пара Call + Put опционов с одинаковым underlying, экспирацией и страйком (стрэддл) или разными страйками (стрэнгл)
+- **Сигнал входа**: Когда ask-цены Call и Put опционов сравниваются (относительная разница < 1%)
+- **Сигнал сброса**: Когда цены расходятся после равенства
+- **Тикеры Bybit**: Формат `UNDERLYING-dayMONTHYY-strike-type-USDT` (например: `BTC-4JAN26-89000-C-USDT`)
+
+### Data Flow
+1. WebSocket (`websocket_manager.py`) получает данные от Bybit → сохраняет в `data_store` (in-memory)
+2. Периодическое сохранение в SQLite БД (`core/data/database.py`) каждые 5 минут (выравнивание по 5-минутным интервалам)
+3. Telegram бот читает из `data_store` для мониторинга цен
+4. LLM агент анализирует историю из БД и принимает решения о сигналах
+
+### Configuration
+- Все секреты (токены, API ключи) берутся из переменных окружения, НЕ хардкодятся
+- Конфигурация в `config.py` (читает из `os.getenv()`)
+- Docker Compose использует `.env` файл для переменных окружения
+
+## Code Style & Conventions
+- **Type hints**: Используй type hints везде где возможно
+- **Logging**: Используй `logging` модуль, логи в stdout (для Docker)
+- **Error Handling**: Обрабатывай ошибки gracefully, логируй но не падай
+- **Async/Await**: Используй async для I/O операций (Telegram bot, API calls)
+- **Database**: SQLite через `core/data/database.py`, используй методы из этого модуля
+
+## Docker & Deployment
+- Все сервисы запускаются через `uv run <script.py>`
+- `docker-compose.yml` определяет 3 сервиса с правильными env переменными
+- Логи выводятся в stdout и в файлы внутри контейнера
+- Порты: API server (8000), Monitoring service (8001)
+- для вызова docker-compose в терминале используется docker compose, например "docker compose up" 
+
+## Important Notes
+- **Не удаляй** существующие файлы без явного запроса пользователя
+- При работе с опционами всегда используй `OptionWebSocketManager.create_option_symbol()` для создания тикеров
+- При добавлении новых зависимостей обновляй `pyproject.toml` и запускай `uv lock`
+- При изменении схемы БД обновляй `ARCHITECTURE.md` с описанием изменений
+- LLM агент запускается периодически (каждый час), не блокируя основной поток
+
+## When User Describes a Task
+1. Сначала прочитай `NOTES.md` и `ARCHITECTURE.md` для полного контекста
+2. Проверь существующий код в соответствующих модулях
+3. Следуй существующим паттернам и структуре
+4. Если нужно добавить новую функциональность - проверь, нет ли похожего кода в других модулях
+5. Всегда используй переменные окружения для секретов
+6. Обновляй документацию при значительных изменениях

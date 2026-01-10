@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  telegram-bot:
+    build: .
+    container_name: option-telegram-bot
+    restart: unless-stopped
+    command: ["uv", "run", "./services/telegram_bot.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TELEGRAM_TOKEN: "${TELEGRAM_TOKEN}"
+      BYBIT_API_KEY: "${BYBIT_API_KEY}"
+      BYBIT_API_SECRET: "${BYBIT_API_SECRET}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+      # URL сервиса мониторинга внутри сети Docker
+      MONITORING_SERVICE_URL: "http://monitoring-service:8001"
+    volumes:
+      # Монтируем директорию data для доступа к БД извне контейнера
+      - ./data:/app/data
+      # Монтируем директорию logs для доступа к логам извне контейнера
+      - ./logs:/app/logs
+
+  api-server:
+    build: .
+    container_name: option-api-server
+    restart: unless-stopped
+    command: ["uv", "run", "uvicorn", "services.api_server:app", "--host", "0.0.0.0", "--port", "7000", "--log-level", "info"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:7000"  # Хост:Контейнер - сервер внутри контейнера слушает на 7000
+    volumes:
+      # Монтируем код для разработки (изменения применяются без пересборки)
+      - .:/app
+      # Монтируем директорию logs для доступа к логам извне контейнера
+      - ./logs:/app/logs
+      # Монтируем директорию static для админ-панели
+      - ./static:/app/static
+
+  monitoring-service:
+    build: .
+    container_name: option-monitoring-service
+    restart: unless-stopped
+    command: ["uv", "run", "main.py"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Внутри Docker monitoring-service ходит в api-server по имени сервиса
+      API_BASE_URL: "http://api-server:8000"
+    ports:
+      - "8001:8001"
+    volumes:
+      # Монтируем директорию logs для доступа к логам извне контейнера
+      - ./logs:/app/logs
+
+
