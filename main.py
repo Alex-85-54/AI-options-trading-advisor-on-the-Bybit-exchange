@@ -12,16 +12,16 @@ import uvicorn
 from contextlib import asynccontextmanager
 import threading
 import time
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('monitoring_service.log')
-    ]
-)
-logger = logging.getLogger(__name__)
+# Добавляем корень проекта в путь для импортов
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
+
+from utils.logging_config import setup_service_logging
+
+# Настройка логирования с ротацией файлов
+logger = setup_service_logging(service_name="monitoring_service", log_level=logging.INFO)
 
 # Базовый URL API берём из переменной окружения (для Docker),
 # локально по умолчанию используется localhost.

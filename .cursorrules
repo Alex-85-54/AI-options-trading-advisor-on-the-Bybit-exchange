@@ -58,8 +58,9 @@ services/
 ## Docker & Deployment
 - Все сервисы запускаются через `uv run <script.py>`
 - `docker-compose.yml` определяет 3 сервиса с правильными env переменными
-- Логи выводятся в stdout (не в файлы внутри контейнера)
+- Логи выводятся в stdout и в файлы внутри контейнера
 - Порты: API server (8000), Monitoring service (8001)
+- для вызова docker-compose в терминале используется docker compose, например "docker compose up" 
 
 ## Important Notes
 - **Не удаляй** существующие файлы без явного запроса пользователя

@@ -1,0 +1,9 @@
+# Logs
+logs/*.log
+logs/*.log.*
+!logs/.gitkeep
+
+# Старые файлы логов (если были)
+*.log
+monitoring_service.log
+trading_bot.log

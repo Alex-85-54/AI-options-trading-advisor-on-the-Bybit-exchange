@@ -25,17 +25,10 @@ from core.data.option_board import get_option_board
 from core.data.database import get_database
 from core.agent.decision_engine import get_decision_engine
 from core.agent.trading_agent import get_trading_agent
+from utils.logging_config import setup_service_logging
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Установите DEBUG для отладки
-
-# Добавьте этот handler если еще нет
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+# Настройка логирования с ротацией файлов
+logger = setup_service_logging(service_name="telegram_bot", log_level=logging.DEBUG)
 
 # Проверка загрузки DEEPSEEK_API_KEY при старте (после настройки logger)
 import os
