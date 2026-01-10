@@ -1054,6 +1054,88 @@ class OptionDatabase:
             raise
         finally:
             conn.close()
+    
+    def get_database_statistics(self) -> Dict[str, any]:
+        """
+        Получить статистику базы данных (количество записей в каждой таблице)
+        
+        Returns:
+            Словарь со статистикой:
+            {
+                'option_history': int,
+                'underlying_history': int,
+                'iv_history': int,
+                'support_resistance_levels': int,
+                'agent_signals': int,
+                'signal_results': int,
+                'total': int,
+                'db_size_mb': float,  # Размер файла БД в МБ
+                'last_update': str  # ISO формат времени последнего обновления
+            }
+        """
+        try:
+            conn = self._get_connection()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            stats = {}
+            
+            # Подсчет записей в каждой таблице
+            tables = [
+                'option_history',
+                'underlying_history',
+                'iv_history',
+                'support_resistance_levels',
+                'agent_signals',
+                'signal_results'
+            ]
+            
+            total = 0
+            for table in tables:
+                try:
+                    cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
+                    row = cursor.fetchone()
+                    count = row['count'] if row else 0
+                    stats[table] = count
+                    total += count
+                except sqlite3.Error:
+                    # Таблица может не существовать
+                    stats[table] = 0
+            
+            stats['total'] = total
+            
+            # Размер файла БД в МБ
+            db_size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+            stats['db_size_mb'] = round(db_size_bytes / (1024 * 1024), 2)
+            
+            # Последняя запись в option_history
+            try:
+                cursor.execute("""
+                    SELECT MAX(date_data_collection) as last_update 
+                    FROM option_history
+                """)
+                row = cursor.fetchone()
+                stats['last_update'] = row['last_update'] if row and row['last_update'] else None
+            except sqlite3.Error:
+                stats['last_update'] = None
+            
+            conn.close()
+            return stats
+            
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении статистики БД: {e}")
+            return {
+                'error': str(e),
+                'option_history': 0,
+                'underlying_history': 0,
+                'iv_history': 0,
+                'support_resistance_levels': 0,
+                'agent_signals': 0,
+                'signal_results': 0,
+                'total': 0,
+                'db_size_mb': 0.0,
+                'last_update': None
+            }
 
 
 # Глобальный экземпляр базы данных

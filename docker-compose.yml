@@ -17,6 +17,8 @@ services:
     volumes:
       # Монтируем директорию data для доступа к БД извне контейнера
       - ./data:/app/data
+      # Монтируем директорию logs для доступа к логам извне контейнера
+      - ./logs:/app/logs
 
   api-server:
     build: .
@@ -27,6 +29,11 @@ services:
       PYTHONUNBUFFERED: "1"
     ports:
       - "8000:8000"
+    volumes:
+      # Монтируем директорию logs для доступа к логам извне контейнера
+      - ./logs:/app/logs
+      # Монтируем директорию static для админ-панели
+      - ./static:/app/static
 
   monitoring-service:
     build: .
@@ -39,5 +46,8 @@ services:
       API_BASE_URL: "http://api-server:8000"
     ports:
       - "8001:8001"
+    volumes:
+      # Монтируем директорию logs для доступа к логам извне контейнера
+      - ./logs:/app/logs
 
 
