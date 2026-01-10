@@ -21,7 +21,7 @@ print("=" * 50, flush=True)
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config import CONFIG, STRATEGY_CONFIG, AGENT_CONFIG, DATA_CONFIG, SUBSCRIPTION_CONFIG, ANALYSIS_CONFIG
+from config import CONFIG, STRATEGY_CONFIG, AGENT_CONFIG, DATA_CONFIG, SUBSCRIPTION_CONFIG, ANALYSIS_CONFIG, format_datetime_local
 from services.websocket_manager import ws_manager
 from services.data_store import data_store
 from core.data.database import get_database
@@ -281,16 +281,18 @@ async def get_application_status():
             "last_update": last_update.isoformat() if last_update else None
         }
         
-        # Статус WebSocket менеджера - проверяем не только is_connected, но и наличие ws и активных символов
-        # WebSocket считается подключенным, если:
-        # 1. is_connected = True, ИЛИ
-        # 2. есть ws объект и активные символы, ИЛИ
-        # 3. есть данные в data_store (значит WebSocket работает, даже если статус не обновлен)
+        # Статус WebSocket менеджера - проверяем реальное состояние
+        # WebSocket для опционов считается подключенным, если есть активные символы
+        # (WebSocket подключается только когда пользователь добавляет опционы через бота)
         has_ws_object = ws_manager.ws is not None
         has_active_symbols = len(ws_manager.active_symbols) > 0
         has_data_in_store = len(all_data) > 0  # Если есть данные, значит WebSocket работал
         
-        ws_connected = ws_manager.is_connected or (has_ws_object and has_active_symbols) or has_data_in_store
+        # WebSocket считается подключенным если:
+        # 1. is_connected = True (официальный статус)
+        # 2. есть ws объект И есть активные символы (реальное подключение)
+        # 3. есть данные в data_store (WebSocket работал недавно, даже если статус сброшен)
+        ws_connected = (ws_manager.is_connected) or (has_ws_object and has_active_symbols) or (has_data_in_store and has_active_symbols)
         
         ws_status = {
             "connected": ws_connected,
@@ -324,6 +326,56 @@ async def get_database_stats():
     try:
         db = get_database()
         stats = db.get_database_statistics()
+        
+        # Конвертируем last_update в локальный часовой пояс (UTC+7)
+        last_update_str = None
+        if stats.get('last_update'):
+            try:
+                last_update_value = stats['last_update']
+                # Если last_update это строка (из БД может быть строка или datetime)
+                if isinstance(last_update_value, str):
+                    # Пробуем разные форматы
+                    try:
+                        # ISO формат с часовым поясом
+                        last_update_dt = datetime.fromisoformat(last_update_value.replace('Z', '+00:00'))
+                    except ValueError:
+                        try:
+                            # ISO формат без часового пояса (предполагаем UTC)
+                            last_update_dt = datetime.fromisoformat(last_update_value)
+                            # Добавляем UTC если нет timezone
+                            if last_update_dt.tzinfo is None:
+                                from datetime import timezone as tz
+                                last_update_dt = last_update_dt.replace(tzinfo=tz.utc)
+                        except ValueError:
+                            # Формат из SQLite: YYYY-MM-DD HH:MM:SS или YYYY-MM-DDTHH:MM:SS
+                            from datetime import datetime as dt
+                            # Пробуем разные форматы
+                            for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S.%f']:
+                                try:
+                                    last_update_dt = dt.strptime(last_update_value, fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                            else:
+                                # Если ни один формат не подошел, используем текущее время
+                                logger.warning(f"Unknown date format: {last_update_value}")
+                                last_update_dt = datetime.now()
+                            
+                            # Добавляем UTC если нет timezone (данные из БД считаются UTC)
+                            if last_update_dt.tzinfo is None:
+                                from datetime import timezone as tz
+                                last_update_dt = last_update_dt.replace(tzinfo=tz.utc)
+                    
+                    last_update_str = format_datetime_local(last_update_dt)
+                # Если это datetime объект
+                elif isinstance(last_update_value, datetime):
+                    last_update_str = format_datetime_local(last_update_value)
+                else:
+                    last_update_str = str(last_update_value)
+            except Exception as e:
+                logger.warning(f"Error formatting last_update: {e}, value: {stats.get('last_update')}", exc_info=True)
+                last_update_str = str(stats.get('last_update'))
+        
         # Убеждаемся, что все ожидаемые поля присутствуют
         result = {
             'option_history': stats.get('option_history', 0),
@@ -334,7 +386,7 @@ async def get_database_stats():
             'signal_results': stats.get('signal_results', 0),
             'total': stats.get('total', 0),
             'db_size_mb': stats.get('db_size_mb', 0.0),
-            'last_update': stats.get('last_update')
+            'last_update': last_update_str  # Используем отформатированную дату
         }
         return result
     except Exception as e:
@@ -443,10 +495,15 @@ async def websocket_logs(websocket: WebSocket):
         ]
         initial_logs = filtered_logs[-100:] if len(filtered_logs) > 100 else filtered_logs
         
-        await websocket.send_text(json.dumps({
-            "type": "initial",
-            "logs": initial_logs
-        }, default=str))
+        # Отправляем начальные логи
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "initial",
+                "logs": initial_logs
+            }, default=str, ensure_ascii=False))
+            logger.debug(f"Sent {len(initial_logs)} initial logs via WebSocket")
+        except Exception as e:
+            logger.error(f"Error sending initial logs: {e}", exc_info=True)
         
         # Отслеживаем новые логи (простое решение - опрос каждые 0.5 секунды)
         last_logs_count = len(log_buffer.logs)
@@ -465,10 +522,13 @@ async def websocket_logs(websocket: WebSocket):
                 ]
                 
                 if filtered_new_logs:
-                    await websocket.send_text(json.dumps({
-                        "type": "update",
-                        "logs": filtered_new_logs
-                    }, default=str))
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "type": "update",
+                            "logs": filtered_new_logs
+                        }, default=str, ensure_ascii=False))
+                    except Exception as e:
+                        logger.error(f"Error sending log update: {e}", exc_info=True)
                 
                 last_logs_count = current_logs_count
             

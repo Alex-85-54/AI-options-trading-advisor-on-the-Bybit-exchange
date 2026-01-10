@@ -1115,7 +1115,11 @@ class OptionDatabase:
                     FROM option_history
                 """)
                 row = cursor.fetchone()
-                stats['last_update'] = row['last_update'] if row and row['last_update'] else None
+                if row and row['last_update']:
+                    # SQLite возвращает строку формата ISO (YYYY-MM-DDTHH:MM:SS)
+                    stats['last_update'] = row['last_update']
+                else:
+                    stats['last_update'] = None
             except sqlite3.Error:
                 stats['last_update'] = None
             

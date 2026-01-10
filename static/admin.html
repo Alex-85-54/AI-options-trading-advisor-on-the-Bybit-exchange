@@ -457,8 +457,9 @@
                 html += '</div>';
                 
                 if (data.last_update) {
+                    // last_update уже в формате UTC+7 от сервера, просто отображаем
                     html += '<div class="refresh-info" style="margin-top: 15px;">Последнее обновление БД: ' + 
-                        new Date(data.last_update).toLocaleString('ru-RU') + '</div>';
+                        data.last_update + '</div>';
                 }
                 
                 document.getElementById('dbStats').innerHTML = html;
@@ -510,14 +511,20 @@
             };
             
             logsWs.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                
-                if (data.type === 'initial') {
-                    displayLogs(data.logs);
-                } else if (data.type === 'update') {
-                    appendLogs(data.logs);
-                } else if (data.type === 'heartbeat') {
-                    // Heartbeat - игнорируем
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'initial') {
+                        displayLogs(data.logs || []);
+                    } else if (data.type === 'update') {
+                        appendLogs(data.logs || []);
+                    } else if (data.type === 'heartbeat') {
+                        // Heartbeat - игнорируем
+                    }
+                } catch (error) {
+                    console.error('Error parsing WebSocket message:', error, event.data);
+                    document.getElementById('logsContainer').innerHTML = 
+                        '<div style="color: #ef4444;">Ошибка парсинга логов: ' + error.message + '</div>';
                 }
             };
             
@@ -560,21 +567,49 @@
 
         // Добавление одного лога
         function appendLog(log) {
+            if (!log) return;
+            
             const container = document.getElementById('logsContainer');
+            // Убираем сообщение о загрузке если есть
+            if (container.innerHTML.includes('Подключение к логам') || container.innerHTML.includes('Загрузка')) {
+                container.innerHTML = '';
+            }
+            
             const entry = document.createElement('div');
             entry.className = 'log-entry';
             
-            const timestamp = new Date(log.timestamp).toLocaleTimeString('ru-RU');
-            entry.innerHTML = '<span class="log-timestamp">' + timestamp + '</span>' +
-                '<span class="log-level ' + log.level + '">' + log.level + '</span>' +
-                '<span class="log-message">' + escapeHtml(log.message) + '</span>';
-            
-            container.appendChild(entry);
-            
-            // Ограничиваем количество логов (последние 500)
-            const entries = container.querySelectorAll('.log-entry');
-            if (entries.length > 500) {
-                entries[0].remove();
+            try {
+                // Обрабатываем timestamp - может быть строка или объект
+                let timestampStr = '';
+                if (log.timestamp) {
+                    if (typeof log.timestamp === 'string') {
+                        timestampStr = new Date(log.timestamp).toLocaleTimeString('ru-RU');
+                    } else {
+                        timestampStr = new Date(log.timestamp).toLocaleTimeString('ru-RU');
+                    }
+                } else {
+                    timestampStr = new Date().toLocaleTimeString('ru-RU');
+                }
+                
+                const level = log.level || 'INFO';
+                const message = log.message || JSON.stringify(log);
+                
+                entry.innerHTML = '<span class="log-timestamp">' + timestampStr + '</span>' +
+                    '<span class="log-level ' + level + '">' + level + '</span>' +
+                    '<span class="log-message">' + escapeHtml(String(message)) + '</span>';
+                
+                container.appendChild(entry);
+                
+                // Ограничиваем количество логов (последние 500)
+                const entries = container.querySelectorAll('.log-entry');
+                if (entries.length > 500) {
+                    entries[0].remove();
+                }
+                
+                // Прокручиваем вниз
+                container.scrollTop = container.scrollHeight;
+            } catch (error) {
+                console.error('Error appending log:', error, log);
             }
         }
 
