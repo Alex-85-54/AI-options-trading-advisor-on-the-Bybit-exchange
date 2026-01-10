@@ -144,9 +144,11 @@ class DecisionEngine:
                 }
             
             # Анализ IVR для каждого опциона
+            # Используем новый подход с похожими опционами
             ivr_analysis = {}
-            for symbol in options_data.keys():
-                ivr_info = self.iv_filter.get_ivr_info(symbol)
+            for symbol, data in options_data.items():
+                # Передаем данные опциона для получения текущей IV
+                ivr_info = self.iv_filter.get_ivr_info(symbol, option_data=data)
                 if ivr_info.get('ivr') is not None:
                     ivr_analysis[symbol] = ivr_info
             

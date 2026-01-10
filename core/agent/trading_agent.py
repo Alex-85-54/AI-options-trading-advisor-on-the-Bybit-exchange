@@ -5,6 +5,7 @@
 import logging
 import json
 import time
+import os
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -46,8 +47,19 @@ class TradingAgent:
             )
         
         self.api_key = api_key or AGENT_CONFIG.get("deepseek_api_key", "")
+        
+        # Убираем кавычки, если они есть (на случай если переменная окружения была в кавычках)
+        if self.api_key:
+            self.api_key = self.api_key.strip().strip('"').strip("'")
+        
         if not self.api_key:
-            logger.warning("DeepSeek API key not provided. Agent will not be able to make API calls.")
+            logger.warning(
+                "DeepSeek API key not provided. Agent will not be able to make API calls.\n"
+                f"AGENT_CONFIG['deepseek_api_key'] = '{AGENT_CONFIG.get('deepseek_api_key', '')}'\n"
+                f"DEEPSEEK_API_KEY env var = '{os.getenv('DEEPSEEK_API_KEY', 'NOT_SET')}'"
+            )
+        else:
+            logger.info(f"DeepSeek API key loaded (length: {len(self.api_key)}, starts with: {self.api_key[:7]}...)")
         
         self.model = model or AGENT_CONFIG.get("deepseek_model", "deepseek-chat")
         self.base_url = AGENT_CONFIG.get("deepseek_base_url", "https://api.deepseek.com")

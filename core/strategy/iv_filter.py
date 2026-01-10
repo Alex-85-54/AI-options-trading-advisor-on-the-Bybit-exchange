@@ -19,18 +19,30 @@ class IVFilter:
         self.analyzer = get_historical_analyzer()
         self.ivr_threshold = STRATEGY_CONFIG.get("ivr_threshold", 25.0)
     
-    def check_ivr(self, symbol: str) -> Optional[bool]:
+    def check_ivr(self, symbol: str, option_data: Optional[Dict] = None) -> Optional[bool]:
         """
         Проверить, проходит ли опцион фильтр по IVR
         
         Args:
             symbol: Символ опциона
+            option_data: Опциональные данные опциона для получения текущей IV
+                        (может содержать 'mark_iv', 'iv', 'ask_iv', 'bid_iv')
             
         Returns:
             True если IVR < threshold (подходит для продажи), False если нет, None если недостаточно данных
         """
         try:
-            ivr = self.analyzer.calculate_ivr(symbol)
+            # Извлекаем текущую IV из данных опциона, если они переданы
+            current_iv = None
+            if option_data:
+                current_iv = (
+                    option_data.get('mark_iv') or 
+                    option_data.get('iv') or 
+                    option_data.get('ask_iv') or 
+                    option_data.get('bid_iv')
+                )
+            
+            ivr = self.analyzer.calculate_ivr(symbol, current_iv=current_iv)
             
             if ivr is None:
                 logger.debug(f"Не удалось вычислить IVR для {symbol}")
@@ -62,7 +74,8 @@ class IVFilter:
         filtered = {}
         
         for symbol, data in options_data.items():
-            if self.check_ivr(symbol):
+            # Передаем данные опциона для получения текущей IV
+            if self.check_ivr(symbol, option_data=data):
                 filtered[symbol] = data
         
         logger.info(
@@ -72,17 +85,28 @@ class IVFilter:
         
         return filtered
     
-    def get_ivr_info(self, symbol: str) -> Dict:
+    def get_ivr_info(self, symbol: str, option_data: Optional[Dict] = None) -> Dict:
         """
         Получить информацию об IVR для опциона
         
         Args:
             symbol: Символ опциона
+            option_data: Опциональные данные опциона для получения текущей IV
             
         Returns:
-            Словарь с информацией: ivr, threshold, passes
+            Словарь с информацией: ivr, threshold, passes, message
         """
-        ivr = self.analyzer.calculate_ivr(symbol)
+        # Извлекаем текущую IV из данных опциона, если они переданы
+        current_iv = None
+        if option_data:
+            current_iv = (
+                option_data.get('mark_iv') or 
+                option_data.get('iv') or 
+                option_data.get('ask_iv') or 
+                option_data.get('bid_iv')
+            )
+        
+        ivr = self.analyzer.calculate_ivr(symbol, current_iv=current_iv)
         
         if ivr is None:
             return {

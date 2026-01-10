@@ -13,7 +13,79 @@ logger = logging.getLogger(__name__)
 
 
 class OptionDatabase:
-    """Класс для работы с SQLite базой данных опционов"""
+    """
+    Класс для работы с SQLite базой данных опционов
+    
+    Структура базы данных:
+    
+    1. option_history - основная таблица истории опционов
+       Поля:
+       - symbol: TEXT - символ опциона (например, 'BTC-4JAN26-89000-C-USDT')
+       - date_data_collection: DATETIME - дата/время сбора данных (округлено до 5 минут)
+       - expiration_date: DATE - дата экспирации опциона
+       - underlying_ticker: TEXT - базовый актив ('BTC', 'ETH', 'SOL')
+       - days_to_expiration: INTEGER - количество дней до экспирации (вычисляется при сохранении)
+       - ask_price, bid_price, mark_price: REAL - цены опциона
+       - iv, ask_iv, bid_iv, mark_iv: REAL - implied volatility
+       - delta, gamma, vega, theta: REAL - греки опциона
+       - volume_24h, open_interest: REAL - объем и открытый интерес
+       - underlying_price: REAL - цена базового актива
+       
+       Индексы:
+       - idx_option_history_symbol: по symbol
+       - idx_option_history_date_data_collection: по date_data_collection
+       - idx_option_history_underlying_expiration: по (underlying_ticker, expiration_date)
+       - idx_option_history_days_to_expiration: по days_to_expiration
+       - idx_option_history_underlying_days: по (underlying_ticker, days_to_expiration)
+    
+    2. underlying_history - история цен базовых активов
+       Поля:
+       - symbol: TEXT - символ базового актива ('BTC', 'ETH')
+       - timestamp: DATETIME - временная метка
+       - price: REAL - цена актива
+       
+    3. iv_history - история IV (для быстрого доступа)
+       Поля:
+       - symbol: TEXT - символ опциона
+       - timestamp: DATETIME - временная метка
+       - iv: REAL - implied volatility
+       - ivr: REAL - IV Rank (может быть вычислен позже)
+    
+    4. support_resistance_levels - уровни поддержки/сопротивления от пользователя
+       Поля:
+       - underlying: TEXT - базовый актив
+       - level_type: TEXT - 'support' или 'resistance'
+       - price: REAL - цена уровня
+       - created_at: DATETIME - дата создания
+       
+    5. agent_signals - история сигналов от агента
+       Поля:
+       - signal_type: TEXT - тип сигнала ('strangle', 'straddle', 'call', 'put')
+       - underlying: TEXT - базовый актив
+       - expiration: TEXT - дата экспирации
+       - strike_call, strike_put, strike: REAL - страйки
+       - reasoning: TEXT - обоснование решения
+       - confidence: REAL - уверенность (0-1)
+       - risk_level: TEXT - уровень риска
+       - created_at: DATETIME - дата создания
+       - agent_version: TEXT - версия агента
+       
+    6. signal_results - результаты сигналов (для анализа эффективности)
+       Поля:
+       - signal_id: INTEGER - ID сигнала (FK к agent_signals)
+       - entry_price, exit_price: REAL - цены входа/выхода
+       - pnl: REAL - прибыль/убыток
+       - entry_timestamp, exit_timestamp: DATETIME
+       - status: TEXT - 'pending', 'entered', 'closed', 'expired'
+       - notes: TEXT
+       
+    Важные особенности:
+    - В БД сохраняются ТОЛЬКО OTM (Out of The Money) опционы
+    - ITM и ATM опционы не сохраняются
+    - Данные округляются до 5-минутных интервалов при сохранении
+    - days_to_expiration вычисляется автоматически при сохранении
+    - Для анализа похожих опционов используется запрос по (underlying_ticker, days_to_expiration)
+    """
     
     def __init__(self, db_path: Optional[str] = None):
         """
@@ -38,6 +110,21 @@ class OptionDatabase:
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row  # Для доступа к колонкам по имени
         return conn
+    
+    def _log_sql_query(self, query: str, params: Tuple = None):
+        """
+        Логировать SQL запрос для отладки
+        
+        Args:
+            query: SQL запрос
+            params: Параметры запроса
+        """
+        if params:
+            # Форматируем параметры для логирования (безопасно)
+            params_str = ", ".join([str(p) for p in params])
+            logger.debug(f"SQL Query: {query} | Params: ({params_str})")
+        else:
+            logger.debug(f"SQL Query: {query}")
     
     def _round_to_5_minutes(self, dt: datetime) -> datetime:
         """
@@ -417,12 +504,16 @@ class OptionDatabase:
         try:
             since = datetime.now() - timedelta(days=days)
             
-            cursor.execute("""
+            query = """
                 SELECT date_data_collection, delta, gamma, vega, theta, iv, mark_price
                 FROM option_history
                 WHERE symbol = ? AND date_data_collection >= ?
                 ORDER BY date_data_collection ASC
-            """, (symbol, since.isoformat()))
+            """
+            params = (symbol, since.isoformat())
+            
+            self._log_sql_query(query, params)
+            cursor.execute(query, params)
             
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
@@ -435,7 +526,7 @@ class OptionDatabase:
     
     def get_iv_statistics(self, symbol: str, days: int = 30) -> Dict:
         """
-        Получить статистику IV для опциона
+        Получить статистику IV для опциона (по конкретному символу)
         
         Args:
             symbol: Символ опциона
@@ -450,12 +541,15 @@ class OptionDatabase:
         try:
             since = datetime.now() - timedelta(days=days)
             
-            # Получаем все значения IV
-            cursor.execute("""
+            query = """
                 SELECT iv FROM option_history
                 WHERE symbol = ? AND date_data_collection >= ? AND iv IS NOT NULL
                 ORDER BY date_data_collection ASC
-            """, (symbol, since.isoformat()))
+            """
+            params = (symbol, since.isoformat())
+            
+            self._log_sql_query(query, params)
+            cursor.execute(query, params)
             
             iv_values = [row[0] for row in cursor.fetchall()]
             
@@ -494,6 +588,116 @@ class OptionDatabase:
             
         except sqlite3.Error as e:
             logger.error(f"Ошибка при получении статистики IV для {symbol}: {e}")
+            raise
+        finally:
+            conn.close()
+    
+    def get_iv_statistics_by_similar_options(
+        self, 
+        underlying_ticker: str, 
+        days_to_expiration: int, 
+        days: int = 30,
+        current_iv: Optional[float] = None
+    ) -> Dict:
+        """
+        Получить статистику IV для похожих опционов
+        
+        Похожие опционы определяются по:
+        - underlying_ticker (например, 'BTC')
+        - days_to_expiration (например, 2 для опционов, экспирирующихся через 2 дня)
+        
+        Этот метод используется когда конкретный тикер может быть новым (недавно созданным на бирже),
+        и для него недостаточно исторических данных. Вместо этого анализируются похожие опционы
+        с теми же параметрами, которые имеют больше истории.
+        
+        Args:
+            underlying_ticker: Базовый актив (например, 'BTC', 'ETH')
+            days_to_expiration: Количество дней до экспирации (например, 1, 2, 3)
+            days: Количество дней истории для запроса (по умолчанию 30)
+            current_iv: Текущее значение IV для опциона (если None, берется последнее из истории похожих)
+            
+        Returns:
+            Словарь со статистикой: min, max, mean, current, percentiles, count
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            since = datetime.now() - timedelta(days=days)
+            
+            # Запрашиваем IV всех похожих опционов (с тем же underlying и days_to_expiration)
+            query = """
+                SELECT iv, symbol, date_data_collection
+                FROM option_history
+                WHERE underlying_ticker = ? 
+                  AND days_to_expiration = ?
+                  AND date_data_collection >= ? 
+                  AND iv IS NOT NULL
+                ORDER BY date_data_collection ASC
+            """
+            params = (underlying_ticker, days_to_expiration, since.isoformat())
+            
+            self._log_sql_query(query, params)
+            cursor.execute(query, params)
+            
+            rows = cursor.fetchall()
+            iv_values = [row[0] for row in rows]
+            
+            if not iv_values:
+                logger.warning(
+                    f"Не найдено исторических данных для похожих опционов: "
+                    f"underlying={underlying_ticker}, days_to_exp={days_to_expiration}, days={days}"
+                )
+                return {
+                    'min': None,
+                    'max': None,
+                    'mean': None,
+                    'current': current_iv,
+                    'count': 0,
+                    'similar_symbols_count': 0
+                }
+            
+            # Вычисляем статистику
+            import statistics
+            
+            # Если current_iv не передан, используем последнее значение из истории похожих опционов
+            if current_iv is None:
+                current_iv = iv_values[-1]
+            
+            # Получаем количество уникальных символов в выборке
+            unique_symbols = len(set(row[1] for row in rows))
+            
+            result = {
+                'min': min(iv_values),
+                'max': max(iv_values),
+                'mean': statistics.mean(iv_values),
+                'median': statistics.median(iv_values),
+                'current': current_iv,
+                'count': len(iv_values),
+                'similar_symbols_count': unique_symbols  # Сколько разных тикеров использовалось
+            }
+            
+            # Вычисляем процентили, если есть достаточно данных
+            if len(iv_values) >= 10:
+                sorted_iv = sorted(iv_values)
+                result['p25'] = sorted_iv[int(len(sorted_iv) * 0.25)]
+                result['p75'] = sorted_iv[int(len(sorted_iv) * 0.75)]
+                result['p90'] = sorted_iv[int(len(sorted_iv) * 0.90)]
+                result['p95'] = sorted_iv[int(len(sorted_iv) * 0.95)]
+            
+            logger.info(
+                f"Статистика IV для похожих опционов: underlying={underlying_ticker}, "
+                f"days_to_exp={days_to_expiration}, записей={len(iv_values)}, "
+                f"уникальных_тикеров={unique_symbols}, min={result['min']:.2f}, max={result['max']:.2f}"
+            )
+            
+            return result
+            
+        except sqlite3.Error as e:
+            logger.error(
+                f"Ошибка при получении статистики IV для похожих опционов "
+                f"(underlying={underlying_ticker}, days_to_exp={days_to_expiration}): {e}"
+            )
             raise
         finally:
             conn.close()
@@ -563,6 +767,7 @@ class OptionDatabase:
                 query += " LIMIT ?"
                 params.append(limit)
             
+            self._log_sql_query(query, tuple(params))
             cursor.execute(query, params)
             rows = cursor.fetchall()
             return [dict(row) for row in rows]

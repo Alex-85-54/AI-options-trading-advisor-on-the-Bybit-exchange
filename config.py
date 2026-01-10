@@ -1,5 +1,6 @@
-from typing import Dict
+from typing import Dict, Optional
 import os
+from datetime import datetime, timedelta, timezone
 
 # Конфигурация
 CONFIG = {
@@ -43,8 +44,8 @@ SUBSCRIPTION_CONFIG = {
 
 # Конфигурация анализа исторических данных
 ANALYSIS_CONFIG = {
-    "iv_analysis_days": 30,                # Количество дней истории для анализа IV (процентили, IVR)
-    "greeks_analysis_days": 3,             # Количество дней истории для анализа тренда греков
+    "iv_analysis_days": 1,                # Количество дней истории для анализа IV (процентили, IVR)
+    "greeks_analysis_days": 1,             # Количество дней истории для анализа тренда греков
 }
 
 # Конфигурация стратегий анализа
@@ -62,14 +63,25 @@ STRATEGY_CONFIG = {
     "delta_imbalance_threshold": 0.2,      # Порог дисбаланса дельты (разница между Call и Put дельтами)
 }
 
+# Конфигурация часового пояса для отображения времени
+# Часовой пояс для отображения времени пользователю (по умолчанию UTC+7)
+TIMEZONE_OFFSET_HOURS = int(os.getenv("TIMEZONE_OFFSET_HOURS", "7"))  # UTC+7
+
+# Получаем объект часового пояса (используем фиксированный offset для простоты и надежности)
+DISPLAY_TIMEZONE = timezone(timedelta(hours=TIMEZONE_OFFSET_HOURS))
+
 # Конфигурация LLM агента
+# Загружаем API ключ из переменной окружения
+# Убираем кавычки и пробелы, если они есть
+_deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip().strip('"').strip("'")
+
 AGENT_CONFIG = {
     "run_interval_minutes": 60,            # Частота запуска агента (каждый час)
     "run_at_hour_start": True,             # Запускать в начале каждого часа (10:00, 11:00, ...)
     "max_expiration_days": 3,              # Максимальная экспирация для анализа (3 дня)
     "ivr_threshold": 25,                   # Порог IVR для фильтрации
     "min_confidence": 0.6,                 # Минимальная уверенность для сигнала
-    "deepseek_api_key": os.getenv("DEEPSEEK_API_KEY", ""),
+    "deepseek_api_key": _deepseek_api_key,
     "deepseek_model": "deepseek-chat",
     "deepseek_base_url": "https://api.deepseek.com",
     "enable_signal_history": True,         # Сохранение истории сигналов
@@ -79,3 +91,30 @@ AGENT_CONFIG = {
     "api_timeout_seconds": 30,            # Таймаут для API запросов (секунды)
     "skip_on_api_error": True,            # Пропускать цикл при недоступности API (не падать)
 }
+
+
+def format_datetime_local(dt: Optional[datetime], format_str: str = '%Y-%m-%d %H:%M:%S') -> str:
+    """
+    Форматировать datetime в локальный часовой пояс пользователя
+    
+    Args:
+        dt: Объект datetime (если None, возвращает 'никогда')
+        format_str: Строка формата для strftime (по умолчанию '%Y-%m-%d %H:%M:%S')
+        
+    Returns:
+        Отформатированная строка времени в локальном часовом поясе
+    """
+    if dt is None:
+        return 'никогда'
+    
+    # Если datetime наивен (без timezone info), предполагаем что это UTC
+    if dt.tzinfo is None:
+        # Создаем UTC timezone
+        from datetime import timezone as tz
+        dt = dt.replace(tzinfo=tz.utc)
+    
+    # Конвертируем в локальный часовой пояс
+    local_dt = dt.astimezone(DISPLAY_TIMEZONE)
+    
+    # Форматируем
+    return local_dt.strftime(format_str)

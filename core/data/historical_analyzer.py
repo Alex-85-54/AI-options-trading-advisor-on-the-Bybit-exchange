@@ -25,13 +25,23 @@ class HistoricalAnalyzer:
         """
         self.db = get_database(db_path)
     
-    def get_iv_percentiles(self, symbol: str, days: Optional[int] = None) -> Dict:
+    def get_iv_percentiles(
+        self, 
+        symbol: str, 
+        days: Optional[int] = None,
+        use_similar_options: bool = True
+    ) -> Dict:
         """
         Получить процентили IV для опциона за указанный период
+        
+        Новый подход (use_similar_options=True):
+        - Использует похожие опционы (с тем же underlying_ticker и days_to_expiration)
+        - Подходит для новых тикеров с недостаточной историей
         
         Args:
             symbol: Символ опциона (например, 'BTC-4JAN26-89000-C-USDT')
             days: Количество дней истории (по умолчанию из ANALYSIS_CONFIG["iv_analysis_days"])
+            use_similar_options: Использовать новый подход с похожими опционами (по умолчанию True)
             
         Returns:
             Словарь с процентилями и статистикой:
@@ -39,28 +49,44 @@ class HistoricalAnalyzer:
                 - min, max, mean: минимальное, максимальное, среднее значение
                 - current: текущее значение IV
                 - count: количество записей
+                - similar_symbols_count: количество уникальных тикеров в выборке (только для нового подхода)
         """
         if days is None:
             days = ANALYSIS_CONFIG.get("iv_analysis_days", 30)
         
         try:
-            # Получаем статистику IV из базы данных
-            stats = self.db.get_iv_statistics(symbol, days)
+            if use_similar_options:
+                # Новый подход: используем похожие опционы
+                parsed = self.db.parse_option_symbol(symbol)
+                if not parsed or not parsed.get('expiration_date') or not parsed.get('underlying'):
+                    logger.warning(f"Не удалось распарсить символ {symbol}")
+                    return self._empty_percentiles_result()
+                
+                underlying_ticker = parsed['underlying']
+                expiration_date = parsed['expiration_date']
+                collection_date = datetime.now().date()
+                days_to_expiration = (expiration_date - collection_date).days
+                
+                if days_to_expiration < 0:
+                    logger.warning(f"Опцион {symbol} уже экспирировался")
+                    return self._empty_percentiles_result()
+                
+                stats = self.db.get_iv_statistics_by_similar_options(
+                    underlying_ticker=underlying_ticker,
+                    days_to_expiration=days_to_expiration,
+                    days=days,
+                    current_iv=None
+                )
+            else:
+                # Старый подход: только конкретный тикер
+                stats = self.db.get_iv_statistics(symbol, days)
             
             if stats.get('count', 0) == 0:
-                logger.warning(f"Нет данных по IV для {symbol} за последние {days} дней")
-                return {
-                    'p25': None,
-                    'p50': None,
-                    'p75': None,
-                    'p90': None,
-                    'p95': None,
-                    'min': None,
-                    'max': None,
-                    'mean': None,
-                    'current': None,
-                    'count': 0
-                }
+                logger.warning(
+                    f"Нет данных по IV для {symbol} за последние {days} дней "
+                    f"(похожие={use_similar_options})"
+                )
+                return self._empty_percentiles_result()
             
             # Формируем результат с процентилями
             result = {
@@ -71,6 +97,10 @@ class HistoricalAnalyzer:
                 'current': stats.get('current'),
                 'count': stats.get('count', 0)
             }
+            
+            # Добавляем информацию о похожих тикерах, если доступна
+            if 'similar_symbols_count' in stats:
+                result['similar_symbols_count'] = stats['similar_symbols_count']
             
             # Добавляем процентили, если они были вычислены
             if 'p25' in stats:
@@ -83,28 +113,33 @@ class HistoricalAnalyzer:
                 result['p95'] = stats['p95']
             
             logger.debug(
-                f"IV процентили для {symbol}: "
+                f"IV процентили для {symbol} (похожие={use_similar_options}): "
                 f"min={result.get('min'):.2f}, p25={result.get('p25'):.2f}, "
                 f"p50={result.get('p50'):.2f}, p75={result.get('p75'):.2f}, "
-                f"max={result.get('max'):.2f}, current={result.get('current'):.2f}"
+                f"max={result.get('max'):.2f}, current={result.get('current'):.2f}, "
+                f"count={result.get('count', 0)}"
             )
             
             return result
             
         except Exception as e:
             logger.error(f"Ошибка при получении процентилей IV для {symbol}: {e}", exc_info=True)
-            return {
-                'p25': None,
-                'p50': None,
-                'p75': None,
-                'p90': None,
-                'p95': None,
-                'min': None,
-                'max': None,
-                'mean': None,
-                'current': None,
-                'count': 0
-            }
+            return self._empty_percentiles_result()
+    
+    def _empty_percentiles_result(self) -> Dict:
+        """Вернуть пустой результат процентилей"""
+        return {
+            'p25': None,
+            'p50': None,
+            'p75': None,
+            'p90': None,
+            'p95': None,
+            'min': None,
+            'max': None,
+            'mean': None,
+            'current': None,
+            'count': 0
+        }
     
     def get_greeks_trend(self, symbol: str, days: Optional[int] = None) -> Dict:
         """
@@ -198,16 +233,33 @@ class HistoricalAnalyzer:
                 'iv': {'trend': 'unknown', 'change': None, 'change_pct': None}
             }
     
-    def calculate_ivr(self, symbol: str, days: Optional[int] = None) -> Optional[float]:
+    def calculate_ivr(
+        self, 
+        symbol: str, 
+        days: Optional[int] = None,
+        use_similar_options: bool = True,
+        current_iv: Optional[float] = None
+    ) -> Optional[float]:
         """
         Вычислить IV Rank (IVR) для опциона
         
         IV Rank показывает, где находится текущая IV относительно исторического диапазона.
         Формула: IVR = (Текущая IV - Минимальная IV) / (Максимальная IV - Минимальная IV) * 100
         
+        Новый подход (use_similar_options=True):
+        - Определяет days_to_expiration для текущего тикера
+        - Запрашивает историю похожих опционов (с тем же underlying_ticker и days_to_expiration)
+        - Это позволяет анализировать новые тикеры, которые недавно созданы на бирже
+        
+        Старый подход (use_similar_options=False):
+        - Запрашивает историю только по конкретному тикеру
+        - Может вернуть None, если тикер новый и данных мало
+        
         Args:
-            symbol: Символ опциона
+            symbol: Символ опциона (например, 'BTC-12JAN26-93500-P-USDT')
             days: Количество дней истории для расчета диапазона (по умолчанию из ANALYSIS_CONFIG["iv_analysis_days"])
+            use_similar_options: Использовать новый подход с похожими опционами (по умолчанию True)
+            current_iv: Текущее значение IV для опциона (если None, берется из истории)
             
         Returns:
             IV Rank в процентах (0-100) или None, если недостаточно данных
@@ -216,43 +268,138 @@ class HistoricalAnalyzer:
             days = ANALYSIS_CONFIG.get("iv_analysis_days", 30)
         
         try:
-            # Получаем статистику IV
-            stats = self.db.get_iv_statistics(symbol, days)
-            
-            min_iv = stats.get('min')
-            max_iv = stats.get('max')
-            current_iv = stats.get('current')
-            
-            # Проверяем наличие всех необходимых данных
-            if min_iv is None or max_iv is None or current_iv is None:
-                logger.warning(
-                    f"Недостаточно данных для расчета IVR для {symbol}: "
-                    f"min={min_iv}, max={max_iv}, current={current_iv}"
-                )
-                return None
-            
-            # Проверяем, что диапазон не нулевой
-            iv_range = max_iv - min_iv
-            if iv_range == 0:
-                logger.warning(f"Диапазон IV равен нулю для {symbol}, IVR не может быть вычислен")
-                return None
-            
-            # Вычисляем IV Rank
-            ivr = ((current_iv - min_iv) / iv_range) * 100
-            
-            # Ограничиваем значение в диапазоне 0-100
-            ivr = max(0, min(100, ivr))
-            
-            logger.debug(
-                f"IVR для {symbol}: {ivr:.2f}% "
-                f"(current={current_iv:.2f}, min={min_iv:.2f}, max={max_iv:.2f})"
-            )
-            
-            return ivr
+            if use_similar_options:
+                # Новый подход: используем похожие опционы
+                return self._calculate_ivr_by_similar_options(symbol, days, current_iv)
+            else:
+                # Старый подход: только конкретный тикер
+                return self._calculate_ivr_by_symbol(symbol, days)
             
         except Exception as e:
             logger.error(f"Ошибка при расчете IVR для {symbol}: {e}", exc_info=True)
             return None
+    
+    def _calculate_ivr_by_similar_options(
+        self, 
+        symbol: str, 
+        days: int, 
+        current_iv: Optional[float] = None
+    ) -> Optional[float]:
+        """
+        Вычислить IVR используя похожие опционы (новый подход)
+        
+        Args:
+            symbol: Символ опциона
+            days: Количество дней истории
+            current_iv: Текущее значение IV (если None, берется из истории похожих опционов)
+            
+        Returns:
+            IV Rank или None
+        """
+        # Парсим символ для получения параметров
+        parsed = self.db.parse_option_symbol(symbol)
+        if not parsed or not parsed.get('expiration_date') or not parsed.get('underlying'):
+            logger.warning(f"Не удалось распарсить символ {symbol} для анализа похожих опционов")
+            return None
+        
+        underlying_ticker = parsed['underlying']
+        expiration_date = parsed['expiration_date']
+        
+        # Вычисляем days_to_expiration
+        collection_date = datetime.now().date()
+        days_to_expiration = (expiration_date - collection_date).days
+        
+        if days_to_expiration < 0:
+            logger.warning(f"Опцион {symbol} уже экспирировался (days_to_expiration={days_to_expiration})")
+            return None
+        
+        # Запрашиваем статистику по похожим опционам
+        stats = self.db.get_iv_statistics_by_similar_options(
+            underlying_ticker=underlying_ticker,
+            days_to_expiration=days_to_expiration,
+            days=days,
+            current_iv=current_iv
+        )
+        
+        min_iv = stats.get('min')
+        max_iv = stats.get('max')
+        current_iv = stats.get('current')
+        
+        # Проверяем наличие всех необходимых данных
+        if min_iv is None or max_iv is None or current_iv is None:
+            logger.warning(
+                f"Недостаточно данных для расчета IVR для {symbol} (похожие опционы): "
+                f"underlying={underlying_ticker}, days_to_exp={days_to_expiration}, "
+                f"min={min_iv}, max={max_iv}, current={current_iv}, "
+                f"записей={stats.get('count', 0)}, тикеров={stats.get('similar_symbols_count', 0)}"
+            )
+            return None
+        
+        # Проверяем, что диапазон не нулевой
+        iv_range = max_iv - min_iv
+        if iv_range == 0:
+            logger.warning(f"Диапазон IV равен нулю для похожих опционов {symbol}, IVR не может быть вычислен")
+            return None
+        
+        # Вычисляем IV Rank
+        ivr = ((current_iv - min_iv) / iv_range) * 100
+        
+        # Ограничиваем значение в диапазоне 0-100
+        ivr = max(0, min(100, ivr))
+        
+        logger.info(
+            f"IVR для {symbol} (похожие опционы): {ivr:.2f}% "
+            f"(underlying={underlying_ticker}, days_to_exp={days_to_expiration}, "
+            f"current={current_iv:.2f}, min={min_iv:.2f}, max={max_iv:.2f}, "
+            f"записей={stats.get('count', 0)}, тикеров={stats.get('similar_symbols_count', 0)})"
+        )
+        
+        return ivr
+    
+    def _calculate_ivr_by_symbol(self, symbol: str, days: int) -> Optional[float]:
+        """
+        Вычислить IVR используя только конкретный тикер (старый подход)
+        
+        Args:
+            symbol: Символ опциона
+            days: Количество дней истории
+            
+        Returns:
+            IV Rank или None
+        """
+        # Получаем статистику IV
+        stats = self.db.get_iv_statistics(symbol, days)
+        
+        min_iv = stats.get('min')
+        max_iv = stats.get('max')
+        current_iv = stats.get('current')
+        
+        # Проверяем наличие всех необходимых данных
+        if min_iv is None or max_iv is None or current_iv is None:
+            logger.warning(
+                f"Недостаточно данных для расчета IVR для {symbol}: "
+                f"min={min_iv}, max={max_iv}, current={current_iv}, count={stats.get('count', 0)}"
+            )
+            return None
+        
+        # Проверяем, что диапазон не нулевой
+        iv_range = max_iv - min_iv
+        if iv_range == 0:
+            logger.warning(f"Диапазон IV равен нулю для {symbol}, IVR не может быть вычислен")
+            return None
+        
+        # Вычисляем IV Rank
+        ivr = ((current_iv - min_iv) / iv_range) * 100
+        
+        # Ограничиваем значение в диапазоне 0-100
+        ivr = max(0, min(100, ivr))
+        
+        logger.debug(
+            f"IVR для {symbol}: {ivr:.2f}% "
+            f"(current={current_iv:.2f}, min={min_iv:.2f}, max={max_iv:.2f})"
+        )
+        
+        return ivr
     
     def get_comprehensive_analysis(self, symbol: str, iv_days: Optional[int] = None, greeks_days: Optional[int] = None) -> Dict:
         """

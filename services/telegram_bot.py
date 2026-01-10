@@ -18,7 +18,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG
+from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG, format_datetime_local
 from services.websocket_manager import ws_manager
 from services.data_store import data_store
 from core.data.option_board import get_option_board
@@ -36,6 +36,30 @@ if not logger.handlers:
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+# Проверка загрузки DEEPSEEK_API_KEY при старте (после настройки logger)
+import os
+_deepseek_key_from_env = os.getenv("DEEPSEEK_API_KEY", "").strip().strip('"').strip("'")
+_deepseek_key_from_config = AGENT_CONFIG.get("deepseek_api_key", "").strip().strip('"').strip("'")
+
+# Используем print для гарантированного вывода, так как logger может не работать на этом этапе
+if _deepseek_key_from_env:
+    msg = f"✓ DEEPSEEK_API_KEY загружена из env (длина: {len(_deepseek_key_from_env)}, начинается с: {_deepseek_key_from_env[:7]}...)"
+    print(msg)
+    logger.info(msg)
+elif _deepseek_key_from_config:
+    msg = f"✓ DEEPSEEK_API_KEY загружена из config (длина: {len(_deepseek_key_from_config)}, начинается с: {_deepseek_key_from_config[:7]}...)"
+    print(msg)
+    logger.info(msg)
+else:
+    msg = (
+        f"⚠️ DEEPSEEK_API_KEY не найдена!\n"
+        f"  os.getenv('DEEPSEEK_API_KEY') = '{os.getenv('DEEPSEEK_API_KEY', 'NOT_SET')}'\n"
+        f"  AGENT_CONFIG['deepseek_api_key'] = '{_deepseek_key_from_config}'\n"
+        f"  Все env vars с DEEPSEEK: {[k for k in os.environ.keys() if 'DEEPSEEK' in k.upper()]}"
+    )
+    print(msg)
+    logger.warning(msg)
 
 # Конфигурация
 # URL сервиса мониторинга берём из переменной окружения (для Docker),
@@ -104,31 +128,44 @@ class TelegramOptionBot:
             return user_id, chat_id, message_id, update
 
     def _get_main_menu_keyboard(self):
-        """Создать клавиатуру главного меню"""
-        return [
-            [
-                InlineKeyboardButton("➕ Добавить опцион", callback_data="add_option"),
-                InlineKeyboardButton("📋 Мои опционы", callback_data="my_options")
-            ],
-            [
-                InlineKeyboardButton("🗑️ Удалить опцион", callback_data="remove_option"),
-                InlineKeyboardButton("📊 Статус мониторинга", callback_data="monitoring_status")
-            ],
+        """
+        Создать клавиатуру главного меню с группировкой кнопок
+        
+        Группы:
+        - 📊 Аналитика: Агент, Уровни S/R
+        - 💼 Управление позицией: Добавить опцион, Удалить опцион, Статус мониторинга, 
+          Запустить мониторинг, Остановить мониторинг, Текущие цены, Активные сигналы
+        """
+        # Группа "Аналитика" (синяя группа - используем эмодзи для визуального выделения)
+        analytics_group = [
             [
                 InlineKeyboardButton("🤖 Агент", callback_data="agent_status"),
                 InlineKeyboardButton("📊 Уровни S/R", callback_data="set_levels")
+            ]
+        ]
+        
+        # Группа "Управление позицией" (зеленая группа)
+        position_management_group = [
+            [
+                InlineKeyboardButton("➕ Добавить опцион", callback_data="add_option"),
+                InlineKeyboardButton("🗑️ Удалить опцион", callback_data="remove_option")
+            ],
+            [
+                InlineKeyboardButton("📊 Статус мониторинга", callback_data="monitoring_status"),
+                InlineKeyboardButton("📈 Текущие цены", callback_data="current_prices")
             ],
             [
                 InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="start_monitoring"),
                 InlineKeyboardButton("⏹️ Остановить мониторинг", callback_data="stop_monitoring")
             ],
             [
-                InlineKeyboardButton("📈 Текущие цены", callback_data="current_prices"),
                 InlineKeyboardButton("🚨 Активные сигналы", callback_data="active_signals")
-            ],
-            [
-                InlineKeyboardButton("❓ Помощь", callback_data="help")
             ]
+        ]
+        
+        # Объединяем группы и добавляем кнопку помощи
+        return analytics_group + position_management_group + [
+            [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,11 +175,20 @@ class TelegramOptionBot:
         keyboard = self._get_main_menu_keyboard()
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.reply_text(
+        # Добавляем заголовки групп в текст сообщения для визуального разделения
+        message_text = (
             f"👋 Привет, {user.first_name}!\n\n"
             "Я бот для отслеживания опционов Bybit.\n"
             "Отслеживаю равенство цен Call/Put для Стренгла.\n\n"
-            "Выберите действие:",
+            "📊 <b>Аналитика</b>\n"
+            "Агент | Уровни S/R\n\n"
+            "💼 <b>Управление позицией</b>\n"
+            "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
+        )
+
+        await update.message.reply_text(
+            message_text,
+            parse_mode='HTML',
             reply_markup=reply_markup
         )
         return CHOOSING_ACTION
@@ -153,11 +199,20 @@ class TelegramOptionBot:
         await query.answer()
 
         action = query.data
+        
+        # Игнорируем кнопки агента - они обрабатываются отдельным обработчиком
+        if action in ["agent_toggle", "agent_run_now"]:
+            logger.debug(f"handle_callback: игнорируем {action} (обрабатывается _handle_agent_callback)")
+            return CHOOSING_ACTION
+        
+        logger.debug(f"handle_callback: обработка {action}")
 
         if action == "add_option":
             return await self.start_add_option(update, context)
-        elif action == "my_options":
-            return await self.show_my_options(update, context)
+        elif action == "noop":
+            # Заголовки групп (no operation) - просто игнорируем
+            await query.answer("")
+            return CHOOSING_ACTION
         elif action == "remove_option":
             return await self.start_remove_option(update, context)
         elif action == "monitoring_status":
@@ -223,20 +278,27 @@ class TelegramOptionBot:
         keyboard = self._get_main_menu_keyboard()
         reply_markup = InlineKeyboardMarkup(keyboard)
 
+        # Добавляем заголовки групп в текст сообщения для визуального разделения
         message_text = (
-            f"👋 Главное меню\n\n"
-            f"Пользователь: {user.first_name}"
+            f"👋 <b>Главное меню</b>\n\n"
+            f"Пользователь: {user.first_name}\n\n"
+            "📊 <b>Аналитика</b>\n"
+            "Агент | Уровни S/R\n\n"
+            "💼 <b>Управление позицией</b>\n"
+            "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
         )
 
         if is_query:
             await query.edit_message_text(
                 message_text,
+                parse_mode='HTML',
                 reply_markup=reply_markup
             )
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=message_text,
+                parse_mode='HTML',
                 reply_markup=reply_markup
             )
 
@@ -246,12 +308,12 @@ class TelegramOptionBot:
         """Показать справку"""
         user_id, chat_id, message_id, query = self._get_user_info(update)
 
+        # Используем HTML форматирование для надежности (Markdown может вызывать ошибки парсинга)
         help_text = (
-            "📚 *Помощь*\n\n"
-            "*Команды:*\n"
+            "📚 <b>Помощь</b>\n\n"
+            "<b>Команды:</b>\n"
             "/start - Главное меню\n"
             "/add_option - Добавить опцион\n"
-            "/my_options - Мои опционы\n"
             "/remove_option - Удалить опцион\n"
             "/start_monitoring - Запустить мониторинг\n"
             "/stop_monitoring - Остановить мониторинг\n"
@@ -261,12 +323,12 @@ class TelegramOptionBot:
             "/agent_start - Запустить агента\n"
             "/agent_stop - Остановить агента\n"
             "/set_levels - Управление уровнями S/R\n\n"
-            "*Как работает:*\n"
+            "<b>Как работает:</b>\n"
             "1. Добавьте Call и Put опционы\n"
             "2. Запустите мониторинг\n"
             "3. Бот уведомит, когда цены сравняются\n\n"
-            "*Порог:* 1%\n"
-            "*Интервал:* 5 секунд"
+            "<b>Порог:</b> 1%\n"
+            "<b>Интервал:</b> 5 секунд"
         )
 
         keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]]
@@ -275,14 +337,14 @@ class TelegramOptionBot:
         if query:
             await query.edit_message_text(
                 help_text,
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=reply_markup
             )
         else:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=help_text,
-                parse_mode='Markdown',
+                parse_mode='HTML',
                 reply_markup=reply_markup
             )
 
@@ -567,104 +629,6 @@ class TelegramOptionBot:
         return ConversationHandler.END
 
     # ===== ПОКАЗ МОИХ ОПЦИОНОВ =====
-
-    async def show_my_options(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать список опционов пользователя"""
-        # Определяем тип update
-        if hasattr(update, 'callback_query') and update.callback_query:
-            query = update.callback_query
-            await query.answer()
-            user_id = query.from_user.id
-            chat_id = query.message.chat_id
-            message_id = query.message.message_id
-            is_query = True
-        elif hasattr(update, 'message'):
-            query = None
-            user_id = update.effective_user.id
-            chat_id = update.message.chat_id
-            message_id = update.message.message_id
-            is_query = False
-        else:
-            # Это CallbackQuery напрямую
-            query = update
-            await query.answer()
-            user_id = query.from_user.id
-            chat_id = query.message.chat_id
-            message_id = query.message.message_id
-            is_query = True
-
-        options = self.user_options.get(user_id, [])
-
-        if not options:
-            keyboard = [
-                [InlineKeyboardButton("➕ Добавить опцион", callback_data="add_option")],
-                [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            message_text = "📋 *Мои опционы*\n\nУ вас пока нет опционов."
-
-            if is_query and query:
-                await query.edit_message_text(
-                    message_text,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=message_text,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
-                )
-            return CHOOSING_ACTION
-
-        # Группируем по типу
-        call_options = [opt for opt in options if opt['type'] == 'C']
-        put_options = [opt for opt in options if opt['type'] == 'P']
-
-        # Получаем текущие цены
-        price_info = []
-        for opt in options:
-            data = data_store.get(opt['symbol'])
-            if data and 'ask_price' in data:
-                price = data['ask_price']
-                price_info.append(f"• `{opt['symbol']}` - {price:.2f}")
-            else:
-                price_info.append(f"• `{opt['symbol']}` - ожидание данных...")
-
-        message = (
-                f"📋 *Мои опционы*\n\n"
-                f"Всего: *{len(options)}* опционов\n"
-                f"📈 Call: *{len(call_options)}*\n"
-                f"📉 Put: *{len(put_options)}*\n\n"
-                f"*Список опционов:*\n" + "\n".join(price_info[:10])
-        )
-
-        if len(options) > 10:
-            message += f"\n\n... и еще {len(options) - 10} опционов"
-
-        keyboard = [
-            [InlineKeyboardButton("🗑️ Удалить опцион", callback_data="remove_option")],
-            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        if query:
-            await query.edit_message_text(
-                message,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode='Markdown',
-                reply_markup=reply_markup
-            )
-
-        return CHOOSING_ACTION
 
     # ===== УДАЛЕНИЕ ОПЦИОНА =====
 
@@ -1020,7 +984,8 @@ class TelegramOptionBot:
         logger.info(f"Preparing notification: {call_symbol} ({call_price}) / {put_symbol} ({put_price}) - "
                f"diff: {price_diff:.4f} ({relative_diff:.2f}%), is_equal: {is_equal}")
 
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # Используем функцию форматирования с учетом часового пояса
+        timestamp = format_datetime_local(datetime.now())
 
         if is_equal:
             # Цены сравнялись - сигнал к покупке
@@ -1281,10 +1246,12 @@ class TelegramOptionBot:
                 else:
                     put_prices.append(f"• `{opt['symbol']}`: ожидание...")
 
+        # Используем функцию форматирования с учетом часового пояса
+        current_time = format_datetime_local(datetime.now(), format_str='%H:%M:%S')
         message = (
             f"📈 *Текущие цены*\n\n"
             f"Всего опционов: {len(options)}\n"
-            f"Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+            f"Время: {current_time}\n\n"
         )
 
         if call_prices:
@@ -1364,18 +1331,27 @@ class TelegramOptionBot:
         message = f"🤖 *Статус торгового агента*\n\n"
         message += f"Статус: {status_emoji} {status_text}\n"
         
-        if last_run:
-            message += f"Последний запуск: {last_run.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        else:
-            message += f"Последний запуск: никогда\n"
+        # Используем функцию форматирования с учетом часового пояса
+        message += f"Последний запуск: {format_datetime_local(last_run)}\n"
         
         if last_signal:
             signal_type = last_signal.get('signal_type', 'unknown')
             confidence = last_signal.get('confidence', 0)
+            signal_timestamp = last_signal.get('timestamp', 'N/A')
+            
+            # Пытаемся распарсить timestamp, если это строка ISO format
+            if isinstance(signal_timestamp, str) and signal_timestamp != 'N/A':
+                try:
+                    signal_dt = datetime.fromisoformat(signal_timestamp.replace('Z', '+00:00'))
+                    signal_timestamp = format_datetime_local(signal_dt)
+                except (ValueError, AttributeError):
+                    # Если не удалось распарсить, используем как есть
+                    pass
+            
             message += f"\n📊 Последний сигнал:\n"
             message += f"Тип: {signal_type}\n"
             message += f"Уверенность: {confidence:.0%}\n"
-            message += f"Время: {last_signal.get('timestamp', 'N/A')}\n"
+            message += f"Время: {signal_timestamp}\n"
         else:
             message += f"\n📊 Последний сигнал: нет\n"
         
@@ -1591,7 +1567,8 @@ class TelegramOptionBot:
         if timestamp:
             try:
                 dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                message += f"\n*Время:* {dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                # Используем функцию форматирования с учетом часового пояса
+                message += f"\n*Время:* {format_datetime_local(dt)}\n"
             except:
                 message += f"\n*Время:* {timestamp}\n"
         
@@ -1601,130 +1578,161 @@ class TelegramOptionBot:
     
     async def _handle_agent_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик callback для кнопок агента"""
-        query = update.callback_query
-        await query.answer()
-        
-        user_id = query.from_user.id
-        chat_id = query.message.chat_id
-        
-        logger.info(f"🔔 Обработка callback агента: {query.data} (пользователь {user_id})")
-        
-        if query.data == "agent_toggle":
-            if self.agent_enabled.get(user_id, False):
-                # Останавливаем
-                self.agent_enabled[user_id] = False
-                if context.job_queue:
-                    current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
-                    for job in current_jobs:
-                        job.schedule_removal()
-                logger.info(f"⏸ Агент остановлен для пользователя {user_id}")
-                
-                # Обновляем сообщение со статусом
-                await self.agent_status(update, context)
-            else:
-                # Запускаем
-                self.agent_enabled[user_id] = True
-                interval_minutes = AGENT_CONFIG.get("run_interval_minutes", 60)
-                if context.job_queue:
-                    current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
-                    for job in current_jobs:
-                        job.schedule_removal()
-                    job = context.job_queue.run_repeating(
-                        self._run_agent_periodic,
-                        interval=interval_minutes * 60,
-                        first=10,
-                        name=f"agent_{user_id}",
-                        data={'user_id': user_id, 'chat_id': chat_id}
-                    )
-                    logger.info(f"✅ Агент запущен для пользователя {user_id}, интервал: {interval_minutes} мин")
-                else:
-                    logger.error("JobQueue not available in context")
-                
-                # Обновляем сообщение со статусом
-                await self.agent_status(update, context)
-        
-        elif query.data == "agent_run_now":
-            # Запускаем анализ немедленно
-            await query.edit_message_text("🔄 Запуск анализа...")
+        try:
+            query = update.callback_query
+            if not query:
+                logger.error("_handle_agent_callback вызван без callback_query")
+                return
             
-            try:
-                # Проверяем, что агент инициализирован
-                if not self.agent_decision_engine:
-                    logger.error("DecisionEngine не инициализирован")
-                    raise Exception("DecisionEngine не инициализирован")
+            await query.answer()
+            
+            user_id = query.from_user.id
+            chat_id = query.message.chat_id
+            callback_data = query.data
+            
+            logger.info(f"🔔 Обработка callback агента: {callback_data} (пользователь {user_id}, чат {chat_id})")
+            print(f"🔔 DEBUG: _handle_agent_callback вызван с data='{callback_data}' для пользователя {user_id}")
+            
+            if callback_data == "agent_toggle":
+                logger.info(f"🔄 Обработка agent_toggle для пользователя {user_id}")
+                print(f"🔄 DEBUG: agent_toggle - текущее состояние: enabled={self.agent_enabled.get(user_id, False)}")
+                if self.agent_enabled.get(user_id, False):
+                    # Останавливаем
+                    self.agent_enabled[user_id] = False
+                    if context.job_queue:
+                        current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
+                        for job in current_jobs:
+                            job.schedule_removal()
+                    logger.info(f"⏸ Агент остановлен для пользователя {user_id}")
+                    
+                    # Обновляем сообщение со статусом
+                    await self.agent_status(update, context)
+                else:
+                    # Запускаем
+                    self.agent_enabled[user_id] = True
+                    interval_minutes = AGENT_CONFIG.get("run_interval_minutes", 60)
+                    if context.job_queue:
+                        current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
+                        for job in current_jobs:
+                            job.schedule_removal()
+                        job = context.job_queue.run_repeating(
+                            self._run_agent_periodic,
+                            interval=interval_minutes * 60,
+                            first=10,
+                            name=f"agent_{user_id}",
+                            data={'user_id': user_id, 'chat_id': chat_id}
+                        )
+                        logger.info(f"✅ Агент запущен для пользователя {user_id}, интервал: {interval_minutes} мин")
+                    else:
+                        logger.error("JobQueue not available in context")
+                    
+                    # Обновляем сообщение со статусом
+                    await self.agent_status(update, context)
+            
+            elif callback_data == "agent_run_now":
+                # Запускаем анализ немедленно
+                logger.info(f"🔄 Запрос на немедленный запуск анализа агента (пользователь {user_id})")
+                print(f"🔄 DEBUG: agent_run_now - начинаем анализ для пользователя {user_id}")
+                await query.edit_message_text("🔄 Запуск анализа...")
                 
-                # Проверяем API ключ
-                agent = self.agent_decision_engine.agent
-                if not agent or not agent.api_key:
-                    logger.warning("DeepSeek API ключ не установлен")
+                try:
+                    # Проверяем, что агент инициализирован
+                    if not self.agent_decision_engine:
+                        logger.error("DecisionEngine не инициализирован")
+                        raise Exception("DecisionEngine не инициализирован")
+                    
+                    # Проверяем API ключ
+                    agent = self.agent_decision_engine.agent
+                    if not agent or not agent.api_key:
+                        logger.warning("DeepSeek API ключ не установлен")
+                        keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await query.edit_message_text(
+                            "⚠️ *Ошибка конфигурации*\n\n"
+                            "DeepSeek API ключ не установлен.\n"
+                            "Проверьте переменную окружения DEEPSEEK_API_KEY в файле .env",
+                            parse_mode='Markdown',
+                            reply_markup=reply_markup
+                        )
+                        return
+                    
+                    signals_found = []
+                    errors = []
+                    
+                    for underlying in UNDERLYING_ASSETS:
+                        try:
+                            logger.info(f"🤖 Немедленный запуск анализа агента для {underlying} (пользователь {user_id})")
+                            decision = self.agent_decision_engine.make_decision(underlying)
+                            self.agent_last_run[user_id] = datetime.now()
+                            
+                            if decision:
+                                self.agent_last_signal[user_id] = decision
+                                signals_found.append((underlying, decision))
+                                await self._send_agent_signal(chat_id, decision, context)
+                                logger.info(f"✅ Сигнал найден для {underlying}")
+                            else:
+                                logger.info(f"ℹ️ Анализ завершен для {underlying}. Подходящих условий не найдено.")
+                        except Exception as e:
+                            error_msg = f"Ошибка для {underlying}: {str(e)}"
+                            logger.error(f"Ошибка при анализе {underlying}: {e}", exc_info=True)
+                            errors.append(error_msg)
+                    
+                    # Формируем итоговое сообщение
                     keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
                     reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    if signals_found:
+                        message = f"✅ *Анализ завершен*\n\n"
+                        message += f"Найдено сигналов: {len(signals_found)}\n"
+                        for underlying, signal in signals_found:
+                            signal_type = signal.get('signal_type', 'unknown')
+                            confidence = signal.get('confidence', 0)
+                            message += f"\n• {underlying}: {signal_type} (уверенность: {confidence:.0%})"
+                        if errors:
+                            message += f"\n\n⚠️ Ошибки:\n" + "\n".join(errors)
+                    elif errors:
+                        message = f"❌ *Ошибки при анализе*\n\n" + "\n".join(errors)
+                    else:
+                        message = f"ℹ️ *Анализ завершен*\n\n"
+                        message += f"Подходящих условий для входа не найдено для всех активов."
+                    
                     await query.edit_message_text(
-                        "⚠️ *Ошибка конфигурации*\n\n"
-                        "DeepSeek API ключ не установлен.\n"
-                        "Проверьте переменную окружения DEEPSEEK_API_KEY в файле .env",
+                        message,
                         parse_mode='Markdown',
                         reply_markup=reply_markup
                     )
-                    return
-                
-                signals_found = []
-                errors = []
-                
-                for underlying in UNDERLYING_ASSETS:
-                    try:
-                        logger.info(f"🤖 Немедленный запуск анализа агента для {underlying} (пользователь {user_id})")
-                        decision = self.agent_decision_engine.make_decision(underlying)
-                        self.agent_last_run[user_id] = datetime.now()
-                        
-                        if decision:
-                            self.agent_last_signal[user_id] = decision
-                            signals_found.append((underlying, decision))
-                            await self._send_agent_signal(chat_id, decision, context)
-                            logger.info(f"✅ Сигнал найден для {underlying}")
-                        else:
-                            logger.info(f"ℹ️ Анализ завершен для {underlying}. Подходящих условий не найдено.")
-                    except Exception as e:
-                        error_msg = f"Ошибка для {underlying}: {str(e)}"
-                        logger.error(f"Ошибка при анализе {underlying}: {e}", exc_info=True)
-                        errors.append(error_msg)
-                
-                # Формируем итоговое сообщение
-                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                if signals_found:
-                    message = f"✅ *Анализ завершен*\n\n"
-                    message += f"Найдено сигналов: {len(signals_found)}\n"
-                    for underlying, signal in signals_found:
-                        signal_type = signal.get('signal_type', 'unknown')
-                        confidence = signal.get('confidence', 0)
-                        message += f"\n• {underlying}: {signal_type} (уверенность: {confidence:.0%})"
-                    if errors:
-                        message += f"\n\n⚠️ Ошибки:\n" + "\n".join(errors)
-                elif errors:
-                    message = f"❌ *Ошибки при анализе*\n\n" + "\n".join(errors)
-                else:
-                    message = f"ℹ️ *Анализ завершен*\n\n"
-                    message += f"Подходящих условий для входа не найдено для всех активов."
-                
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка при немедленном запуске агента: {e}", exc_info=True)
+                    keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.edit_message_text(
+                        f"❌ Ошибка: {str(e)}",
+                        reply_markup=reply_markup
+                    )
+            
+            else:
+                logger.warning(f"⚠️ Неизвестный callback_data в _handle_agent_callback: {callback_data}")
                 await query.edit_message_text(
-                    message,
-                    parse_mode='Markdown',
-                    reply_markup=reply_markup
+                    f"⚠️ Неизвестная команда: {callback_data}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")
+                    ]])
                 )
                 
-            except Exception as e:
-                logger.error(f"Ошибка при немедленном запуске агента: {e}", exc_info=True)
-                keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    f"❌ Ошибка: {str(e)}",
-                    reply_markup=reply_markup
-                )
-        
-        # Обновляем статус после действий
-        # Не вызываем agent_status здесь, так как уже обновили сообщение через edit_message_text
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка в _handle_agent_callback: {e}", exc_info=True)
+            try:
+                if 'query' in locals() and query:
+                    await query.answer("❌ Произошла ошибка")
+                    await query.edit_message_text(
+                        f"❌ Ошибка: {str(e)}",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")
+                        ]])
+                    )
+            except Exception as e2:
+                logger.error(f"Ошибка при отправке сообщения об ошибке: {e2}", exc_info=True)
     
     # ===== УПРАВЛЕНИЕ УРОВНЯМИ ПОДДЕРЖКИ/СОПРОТИВЛЕНИЯ =====
     
@@ -2164,10 +2172,12 @@ class TelegramOptionBot:
             fallbacks=[
                 CommandHandler("cancel", self.cancel_operation),
                 CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
-                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$"),
+                # Обработка кнопок агента из любого состояния
+                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_run_now)$")
             ]
         )
-
+        
         # ConversationHandler для удаления опциона
         remove_option_conv = ConversationHandler(
             entry_points=[
@@ -2183,7 +2193,9 @@ class TelegramOptionBot:
             fallbacks=[
                 CommandHandler("cancel", self.cancel_operation),
                 CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
-                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$"),
+                # Обработка кнопок агента из любого состояния
+                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_run_now)$")
             ]
         )
         
@@ -2223,14 +2235,15 @@ class TelegramOptionBot:
             fallbacks=[
                 CommandHandler("cancel", self.cancel_operation),
                 CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
-                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$"),
+                # Обработка кнопок агента из любого состояния
+                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_run_now)$")
             ]
         )
 
         # Основной обработчик для главного меню
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("help", self.show_help))
-        application.add_handler(CommandHandler("my_options", self.show_my_options))
         application.add_handler(CommandHandler("monitoring_status", self.show_monitoring_status))
         application.add_handler(CommandHandler("start_monitoring", self.start_monitoring_callback))
         application.add_handler(CommandHandler("stop_monitoring", self.stop_monitoring_callback))
@@ -2250,15 +2263,19 @@ class TelegramOptionBot:
         application.add_handler(remove_option_conv)
         application.add_handler(set_levels_conv)
 
-        # Обработчик callback для кнопок главного меню
-        application.add_handler(CallbackQueryHandler(self.handle_callback))
-        application.add_handler(CallbackQueryHandler(self.handle_callback, pattern="^active_signals$"))
-        
-        # Обработчик callback для кнопок агента
-        application.add_handler(CallbackQueryHandler(
+        # ВАЖНО: Специфичные обработчики должны быть ПЕРЕД общим обработчиком
+        # Обработчик callback для кнопок агента (должен быть первым, чтобы не перехватывался общим обработчиком)
+        agent_callback_handler = CallbackQueryHandler(
             self._handle_agent_callback,
             pattern="^(agent_toggle|agent_run_now)$"
-        ))
+        )
+        application.add_handler(agent_callback_handler)
+        logger.info("✅ Обработчик кнопок агента зарегистрирован (agent_toggle, agent_run_now)")
+        
+        # Обработчик callback для кнопок главного меню (общий обработчик - в конце)
+        application.add_handler(CallbackQueryHandler(self.handle_callback))
+        application.add_handler(CallbackQueryHandler(self.handle_callback, pattern="^active_signals$"))
+        logger.info("✅ Общий обработчик callback зарегистрирован")
 
 
         # Автоматическая подписка на опционы при старте
@@ -2274,5 +2291,17 @@ class TelegramOptionBot:
 
 # Создание и запуск бота
 if __name__ == "__main__":
+    # Дополнительная проверка DEEPSEEK_API_KEY при запуске
+    import os
+    deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip().strip('"').strip("'")
+    if deepseek_key:
+        print(f"✓ DEEPSEEK_API_KEY найдена при запуске (длина: {len(deepseek_key)}, начинается с: {deepseek_key[:7]}...)")
+        logger.info(f"✓ DEEPSEEK_API_KEY найдена при запуске (длина: {len(deepseek_key)})")
+    else:
+        print(f"⚠️ DEEPSEEK_API_KEY не найдена при запуске!")
+        print(f"  os.getenv('DEEPSEEK_API_KEY') = '{os.getenv('DEEPSEEK_API_KEY', 'NOT_SET')}'")
+        print(f"  Все env vars с DEEPSEEK: {[k for k in os.environ.keys() if 'DEEPSEEK' in k.upper()]}")
+        logger.warning(f"⚠️ DEEPSEEK_API_KEY не найдена при запуске! os.getenv('DEEPSEEK_API_KEY') = '{os.getenv('DEEPSEEK_API_KEY', 'NOT_SET')}'")
+    
     bot = TelegramOptionBot(CONFIG["telegram_token"])
     bot.run()

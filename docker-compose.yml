@@ -9,8 +9,9 @@ services:
     environment:
       PYTHONUNBUFFERED: "1"
       TELEGRAM_TOKEN: "${TELEGRAM_TOKEN}"
-      BYBIT_API_KEY: "${BYBIT_API_KEY:-}"
-      BYBIT_API_SECRET: "${BYBIT_API_SECRET:-}"
+      BYBIT_API_KEY: "${BYBIT_API_KEY}"
+      BYBIT_API_SECRET: "${BYBIT_API_SECRET}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
       # URL сервиса мониторинга внутри сети Docker
       MONITORING_SERVICE_URL: "http://monitoring-service:8001"
     volumes:
