@@ -7,3 +7,18 @@ logs/*.log.*
 *.log
 monitoring_service.log
 trading_bot.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+.cursorrulles
+.coverage
