@@ -6,13 +6,12 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config import CONFIG, DATA_CONFIG
+from config import CONFIG, DATA_CONFIG, DISPLAY_TIMEZONE
 from services.data_store import data_store
 import logging
 import json
 from typing import List
-from datetime import datetime, timedelta
-import pandas as pd
+from datetime import datetime, timedelta, timezone
 import time
 from typing import Set
 from utils.logging_config import setup_service_logging
@@ -113,10 +112,10 @@ class OptionWebSocketManager:
             ts_value = item.get('ts')  # Пробуем получить из item
 
             if ts_value:
-                ts = pd.to_datetime(ts_value, unit='ms') + timedelta(hours=7)
+                ts = datetime.fromtimestamp(ts_value / 1000, tz=timezone.utc).astimezone(DISPLAY_TIMEZONE)
             else:
                 # Если нет в item, используем текущее время
-                ts = datetime.now()
+                ts = datetime.now(DISPLAY_TIMEZONE)
 
             # Извлекаем данные с преобразованием типов
             option_data = {

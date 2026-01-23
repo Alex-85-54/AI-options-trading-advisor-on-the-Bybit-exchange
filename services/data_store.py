@@ -1,5 +1,4 @@
 from typing import Dict, List, Optional
-import pandas as pd
 from datetime import datetime, timedelta
 import threading
 import logging
@@ -8,6 +7,7 @@ from apscheduler.triggers.date import DateTrigger
 
 from core.data.database import get_database
 from core.data.option_board import is_otm
+from config import DISPLAY_TIMEZONE
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,14 @@ class OptionDataStore:
     def update(self, symbol: str, data: Dict):
         """Обновить данные по опциону"""
         with self._lock:
+            timestamp = data.get("timestamp")
+            if not isinstance(timestamp, datetime):
+                timestamp = datetime.now(DISPLAY_TIMEZONE)
+            elif timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=DISPLAY_TIMEZONE)
             self._data[symbol] = {
                 **data,
-                'timestamp': datetime.now(),
+                'timestamp': timestamp,
                 'symbol': symbol
             }
 
@@ -69,7 +74,7 @@ class OptionDataStore:
             Следующий момент времени, кратный 5 минутам
         """
         if current_time is None:
-            current_time = datetime.now()
+            current_time = datetime.now(DISPLAY_TIMEZONE)
         
         # Получаем минуты текущего времени
         current_minute = current_time.minute

@@ -21,13 +21,25 @@ print("=" * 50, flush=True)
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config import CONFIG, STRATEGY_CONFIG, AGENT_CONFIG, DATA_CONFIG, SUBSCRIPTION_CONFIG, ANALYSIS_CONFIG
+from config import (
+    CONFIG,
+    STRATEGY_CONFIG,
+    AGENT_CONFIG,
+    DATA_CONFIG,
+    SUBSCRIPTION_CONFIG,
+    ANALYSIS_CONFIG,
+    format_datetime_local,
+    DISPLAY_TIMEZONE,
+)
 from services.websocket_manager import ws_manager
 from services.data_store import data_store
 from core.data.database import get_database
+from core.data.option_board import get_option_board, is_otm
 from utils.logging_config import setup_service_logging
 from utils.log_buffer import get_log_buffer_handler
 import logging
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Настройка логирования с ротацией файлов
 print("Setting up logging...", flush=True)
@@ -63,6 +75,84 @@ static_dir.mkdir(exist_ok=True, parents=True)
 logger.info(f"Static directory: {static_dir.absolute()}")
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
+# Настройки подписок и времени (UTC+7)
+UNDERLYING_ASSETS = ["BTC"]
+SUBSCRIPTION_UPDATE_HOUR = 15
+SUBSCRIPTION_UPDATE_MINUTE = 5
+
+# Глобальные объекты
+option_board = get_option_board()
+subscription_scheduler = BackgroundScheduler(timezone=DISPLAY_TIMEZONE)
+last_subscription_refresh: Optional[datetime] = None
+
+
+def refresh_option_subscriptions() -> Dict[str, int]:
+    """
+    Переподписка на опционы (обновление списка активных символов).
+    Использует доску опционов и переподключает WebSocket.
+    """
+    try:
+        global last_subscription_refresh
+        logger.info("🔄 Запуск переподписки на опционы (UTC+7)")
+        all_symbols: List[str] = []
+        max_days = SUBSCRIPTION_CONFIG.get("max_expiration_days", 3)
+
+        for underlying in UNDERLYING_ASSETS:
+            board_data = option_board.get_option_board(underlying, max_days=max_days)
+            symbols = board_data.get("symbols", [])
+            if symbols:
+                all_symbols.extend(symbols)
+                logger.info(f"✅ {underlying}: найдено {len(symbols)} символов")
+            else:
+                logger.warning(f"⚠️ {underlying}: символы не найдены")
+
+        if not all_symbols:
+            logger.warning("⚠️ Переподписка пропущена: список символов пуст")
+            return {"old_count": len(ws_manager.active_symbols), "new_count": 0}
+
+        # Убираем дубликаты
+        unique_symbols = list(set(all_symbols))
+
+        # Обновляем подписки WebSocket
+        old_count = len(ws_manager.active_symbols)
+        ws_manager.update_subscriptions(unique_symbols)
+        new_count = len(ws_manager.active_symbols)
+        last_subscription_refresh = datetime.now(DISPLAY_TIMEZONE)
+        logger.info(f"✅ Подписки обновлены: было {old_count}, стало {new_count}")
+        return {"old_count": old_count, "new_count": new_count}
+    except Exception as e:
+        logger.error(f"Ошибка при переподписке на опционы: {e}", exc_info=True)
+        return {"old_count": len(ws_manager.active_symbols), "new_count": len(ws_manager.active_symbols)}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Запуск планировщика переподписки"""
+    if not subscription_scheduler.running:
+        subscription_scheduler.add_job(
+            refresh_option_subscriptions,
+            trigger=CronTrigger(
+                hour=SUBSCRIPTION_UPDATE_HOUR,
+                minute=SUBSCRIPTION_UPDATE_MINUTE,
+                timezone=DISPLAY_TIMEZONE,
+            ),
+            id="daily_subscription_update",
+            replace_existing=True,
+        )
+        subscription_scheduler.start()
+        logger.info(
+            f"🕒 Планировщик переподписки запущен (ежедневно в {SUBSCRIPTION_UPDATE_HOUR:02d}:{SUBSCRIPTION_UPDATE_MINUTE:02d} UTC+7)"
+        )
+    # Первичная подписка при старте, чтобы админ-панель сразу показывала актуальные данные
+    refresh_option_subscriptions()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Остановка планировщика"""
+    if subscription_scheduler.running:
+        subscription_scheduler.shutdown()
+
 
 # Pydantic модели
 class OptionSymbol(BaseModel):
@@ -89,7 +179,7 @@ async def health_check():
     """Проверка здоровья сервиса"""
     return {
         "status": "ok",
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
         "static_dir": str(static_dir.absolute()),
         "static_exists": static_dir.exists(),
         "admin_html_exists": (static_dir / "admin.html").exists()
@@ -107,7 +197,7 @@ async def get_option_data(symbol: str):
                 "symbol": symbol,
                 "status": "subscribed",
                 "message": "Waiting for data from exchange",
-                "timestamp": datetime.now().isoformat()
+                "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE))
             }
         else:
             raise HTTPException(
@@ -194,7 +284,10 @@ async def check_option_data(symbol: str):
         # Проверяем актуальность данных (не старше 30 секунд)
         timestamp = data.get('timestamp')
         if isinstance(timestamp, datetime):
-            age = (datetime.now() - timestamp).total_seconds()
+            now = datetime.now(DISPLAY_TIMEZONE)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=DISPLAY_TIMEZONE)
+            age = (now - timestamp).total_seconds()
             is_fresh = age < 30
         else:
             is_fresh = False
@@ -278,7 +371,7 @@ async def get_application_status():
         
         store_stats = {
             "total_options": len(all_data),
-            "last_update": last_update.isoformat() if last_update else None
+            "last_update": format_datetime_local(last_update) if last_update else None
         }
         
         # Статус WebSocket менеджера - проверяем не только is_connected, но и наличие ws и активных символов
@@ -292,16 +385,38 @@ async def get_application_status():
         
         ws_connected = ws_manager.is_connected or (has_ws_object and has_active_symbols) or has_data_in_store
         
+        # Подсчет подписанных OTM опционов (которые сохраняются в БД)
+        otm_subscribed_count = 0
+        for symbol in ws_manager.active_symbols:
+            data = all_data.get(symbol)
+            if not data:
+                continue
+            underlying_price = data.get("underlying_price")
+            if underlying_price is None or underlying_price <= 0:
+                continue
+            parts = symbol.split("-")
+            if len(parts) < 5:
+                continue
+            try:
+                strike = float(parts[2])
+                option_type = parts[3]
+            except (ValueError, IndexError):
+                continue
+            if is_otm(strike, underlying_price, option_type):
+                otm_subscribed_count += 1
+
         ws_status = {
             "connected": ws_connected,
             "active_symbols_count": len(ws_manager.active_symbols),
+            "otm_subscribed_count": otm_subscribed_count,
+            "last_resubscribe": format_datetime_local(last_subscription_refresh) if last_subscription_refresh else None,
             "active_symbols": list(ws_manager.active_symbols)[:50]  # Первые 50 для просмотра
         }
         
         # Общий статус
         return {
             "status": "running",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
             "websocket": ws_status,
             "data_store": store_stats,
             "services": {
@@ -314,7 +429,7 @@ async def get_application_status():
         return {
             "status": "error",
             "error": str(e),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE))
         }
 
 
@@ -478,7 +593,7 @@ async def websocket_logs(websocket: WebSocket):
                 heartbeat_counter = 0
                 await websocket.send_text(json.dumps({
                     "type": "heartbeat",
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE))
                 }, default=str))
             
     except WebSocketDisconnect:

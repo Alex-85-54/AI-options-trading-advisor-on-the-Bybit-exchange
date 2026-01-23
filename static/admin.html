@@ -413,6 +413,18 @@
                 html += '<div class="service-name">Активных символов</div>';
                 html += '<span class="config-value">' + data.websocket.active_symbols_count + '</span>';
                 html += '</div>';
+
+                html += '<div class="service-item">';
+                html += '<div class="service-name">Опций в подписке (OTM, для БД)</div>';
+                html += '<span class="config-value">' + (data.websocket.otm_subscribed_count ?? 0) + '</span>';
+                html += '</div>';
+
+                if (data.websocket.last_resubscribe) {
+                    html += '<div class="service-item">';
+                    html += '<div class="service-name">Последняя переподписка (UTC+7)</div>';
+                    html += '<span class="config-value">' + data.websocket.last_resubscribe + '</span>';
+                    html += '</div>';
+                }
                 
                 html += '<div class="service-item">';
                 html += '<div class="service-name">Опций в памяти</div>';
@@ -421,8 +433,8 @@
                 
                 if (data.data_store.last_update) {
                     html += '<div class="service-item">';
-                    html += '<div class="service-name">Последнее обновление</div>';
-                    html += '<span class="config-value">' + new Date(data.data_store.last_update).toLocaleString('ru-RU') + '</span>';
+                    html += '<div class="service-name">Последнее обновление (UTC+7)</div>';
+                    html += '<span class="config-value">' + data.data_store.last_update + '</span>';
                     html += '</div>';
                 }
                 
@@ -645,7 +657,14 @@
 
         // Обновление времени последнего обновления
         function updateLastUpdateTime() {
-            document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('ru-RU');
+            const now = new Date();
+            const formatter = new Intl.DateTimeFormat('ru-RU', {
+                timeZone: 'Asia/Bangkok',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            document.getElementById('lastUpdate').textContent = formatter.format(now);
         }
 
         // Обновление времени каждую секунду
