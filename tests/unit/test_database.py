@@ -11,7 +11,7 @@ class TestOptionDatabase:
     
     def test_save_option_data(self, test_database, sample_option_symbol, sample_option_data):
         """Тест сохранения данных опциона"""
-        timestamp = datetime.now()
+        timestamp = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         
         test_database.save_option_data(sample_option_symbol, sample_option_data, timestamp)
         
@@ -74,7 +74,7 @@ class TestOptionDatabase:
         # Создаем символ с нужной экспирацией
         symbol = f"BTC-{expiry_str}-89000-C-USDT"
         
-        timestamp = datetime.now()
+        timestamp = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         test_database.save_option_data(symbol, sample_option_data, timestamp)
         
         # Проверяем, что days_to_expiration вычислен правильно

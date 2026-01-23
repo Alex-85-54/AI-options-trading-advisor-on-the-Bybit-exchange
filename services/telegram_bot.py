@@ -84,6 +84,24 @@ MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
 UNDERLYING_ASSETS = ["BTC"]
 
 
+def escape_html(text: str) -> str:
+    """
+    Экранировать специальные символы HTML для безопасного использования в Telegram
+    
+    Args:
+        text: Текст для экранирования
+        
+    Returns:
+        Экранированный текст
+    """
+    if not text:
+        return ""
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
 class TelegramOptionBot:
     def __init__(self, token: str):
         self.token = token
@@ -1489,21 +1507,42 @@ class TelegramOptionBot:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=message,
-                parse_mode='Markdown'
+                parse_mode='HTML'
             )
             
             logger.info(f"✅ Сигнал от агента отправлен в чат {chat_id}")
             
         except Exception as e:
             logger.error(f"Ошибка при отправке сигнала: {e}", exc_info=True)
+            # Пытаемся отправить без форматирования в случае ошибки
+            try:
+                fallback_message = (
+                    f"📊 Торговый сигнал от агента\n\n"
+                    f"Тип: {signal.get('signal_type', 'unknown')}\n"
+                    f"Актив: {signal.get('underlying', 'BTC')}\n"
+                    f"Уверенность: {signal.get('confidence', 0):.0%}\n"
+                )
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=fallback_message,
+                    parse_mode=None
+                )
+            except Exception as e2:
+                logger.error(f"Ошибка при отправке fallback сообщения: {e2}", exc_info=True)
     
     def _format_agent_signal(self, signal: Dict) -> str:
-        """Форматировать сигнал от агента для отправки в Telegram"""
+        """Форматировать сигнал от агента для отправки в Telegram (HTML форматирование)"""
         signal_type = signal.get('signal_type', 'unknown')
         underlying = signal.get('underlying', 'BTC')
         confidence = signal.get('confidence', 0)
         risk_level = signal.get('risk_level', 'medium')
         reasoning = signal.get('reasoning', '')
+        
+        # Экранируем пользовательские данные
+        signal_type_escaped = escape_html(str(signal_type))
+        underlying_escaped = escape_html(str(underlying))
+        risk_level_escaped = escape_html(str(risk_level))
+        reasoning_escaped = escape_html(str(reasoning)) if reasoning else ''
         
         # Эмодзи для типов сигналов
         type_emojis = {
@@ -1530,42 +1569,52 @@ class TelegramOptionBot:
         else:
             conf_emoji = '🟠'
         
-        message = f"{type_emoji} *Торговый сигнал от агента*\n\n"
-        message += f"*Тип позиции:* {signal_type.upper()}\n"
-        message += f"*Базовый актив:* {underlying}\n"
+        message = f"{type_emoji} <b>Торговый сигнал от агента</b>\n\n"
+        message += f"<b>Тип позиции:</b> {signal_type_escaped.upper()}\n"
+        message += f"<b>Базовый актив:</b> {underlying_escaped}\n"
         
         # Детали опционов
         if signal_type in ['strangle', 'straddle']:
             strike_call = signal.get('strike_call')
             strike_put = signal.get('strike_put')
             if strike_call and strike_put:
-                message += f"*Страйк Call:* {strike_call:,.0f}\n"
-                message += f"*Страйк Put:* {strike_put:,.0f}\n"
+                message += f"<b>Страйк Call:</b> {strike_call:,.0f}\n"
+                message += f"<b>Страйк Put:</b> {strike_put:,.0f}\n"
         elif signal_type in ['call', 'put']:
             strike = signal.get('strike')
             if strike:
-                message += f"*Страйк:* {strike:,.0f}\n"
+                message += f"<b>Страйк:</b> {strike:,.0f}\n"
         
         expiration = signal.get('expiration')
         if expiration:
-            message += f"*Экспирация:* {expiration}\n"
+            expiration_escaped = escape_html(str(expiration))
+            message += f"<b>Экспирация:</b> {expiration_escaped}\n"
         
-        message += f"\n*Уверенность:* {conf_emoji} {confidence:.0%}\n"
-        message += f"*Уровень риска:* {risk_emoji} {risk_level}\n"
+        message += f"\n<b>Уверенность:</b> {conf_emoji} {confidence:.0%}\n"
+        message += f"<b>Уровень риска:</b> {risk_emoji} {risk_level_escaped}\n"
         
-        if reasoning:
-            message += f"\n*Обоснование:*\n{reasoning}\n"
+        if reasoning_escaped:
+            # Разбиваем reasoning на строки для лучшей читаемости
+            reasoning_lines = reasoning_escaped.split('\n')
+            message += f"\n<b>Обоснование:</b>\n"
+            for line in reasoning_lines[:10]:  # Ограничиваем количество строк
+                message += f"{line}\n"
+            if len(reasoning_lines) > 10:
+                message += f"... (еще {len(reasoning_lines) - 10} строк)\n"
         
         timestamp = signal.get('timestamp')
         if timestamp:
             try:
                 dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                 # Используем функцию форматирования с учетом часового пояса
-                message += f"\n*Время:* {format_datetime_local(dt)}\n"
+                time_str = format_datetime_local(dt)
+                time_escaped = escape_html(str(time_str))
+                message += f"\n<b>Время:</b> {time_escaped}\n"
             except:
-                message += f"\n*Время:* {timestamp}\n"
+                timestamp_escaped = escape_html(str(timestamp))
+                message += f"\n<b>Время:</b> {timestamp_escaped}\n"
         
-        message += f"\n⚠️ *Внимание:* Это сигнал от ИИ агента. Всегда проверяйте анализ самостоятельно!"
+        message += f"\n⚠️ <b>Внимание:</b> Это сигнал от ИИ агента. Всегда проверяйте анализ самостоятельно!"
         
         return message
     

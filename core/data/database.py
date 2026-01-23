@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
 
+from config import format_datetime_local
+
 logger = logging.getLogger(__name__)
 
 
@@ -139,6 +141,18 @@ class OptionDatabase:
         # Округляем минуты вниз до ближайшего значения, кратного 5
         rounded_minute = (dt.minute // 5) * 5
         return dt.replace(minute=rounded_minute, second=0, microsecond=0)
+
+    def _format_local_datetime(self, dt: datetime) -> str:
+        """
+        Привести datetime к локальному часовому поясу и строковому формату для БД (UTC+7).
+        """
+        return format_datetime_local(dt, '%Y-%m-%d %H:%M:%S')
+
+    def _parse_local_datetime(self, dt_str: str) -> datetime:
+        """
+        Преобразовать локальную строку времени (UTC+7) в datetime для вычислений.
+        """
+        return datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S')
     
     def parse_expiration_date(self, expiry_str: str) -> Optional[date]:
         """
@@ -411,6 +425,8 @@ class OptionDatabase:
         
         # Округляем timestamp до ближайшего 5-минутного интервала
         date_data_collection = self._round_to_5_minutes(timestamp)
+        date_data_collection_str = self._format_local_datetime(date_data_collection)
+        date_data_collection_local = self._parse_local_datetime(date_data_collection_str)
         
         # Парсим символ для извлечения компонентов
         parsed = self.parse_option_symbol(symbol)
@@ -422,7 +438,7 @@ class OptionDatabase:
         underlying_ticker = parsed['underlying']
         
         # Вычисляем days_to_expiration
-        collection_date = date_data_collection.date()
+        collection_date = date_data_collection_local.date()
         days_to_expiration = (expiration_date - collection_date).days
         
         conn = self._get_connection()
@@ -442,7 +458,7 @@ class OptionDatabase:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol,
-                date_data_collection.isoformat(),
+                date_data_collection_str,
                 expiration_date.isoformat(),
                 underlying_ticker,
                 days_to_expiration,
@@ -467,7 +483,7 @@ class OptionDatabase:
                 cursor.execute("""
                     INSERT OR REPLACE INTO iv_history (symbol, timestamp, iv)
                     VALUES (?, ?, ?)
-                """, (symbol, date_data_collection.isoformat(), iv))
+                """, (symbol, date_data_collection_str, iv))
             
             # Сохраняем цену базового актива
             underlying_price = option_data.get('underlying_price')
@@ -475,10 +491,13 @@ class OptionDatabase:
                 cursor.execute("""
                     INSERT OR REPLACE INTO underlying_history (symbol, timestamp, price)
                     VALUES (?, ?, ?)
-                """, (underlying_ticker, date_data_collection.isoformat(), underlying_price))
+                """, (underlying_ticker, date_data_collection_str, underlying_price))
             
             conn.commit()
-            logger.debug(f"Сохранены данные опциона {symbol} на {date_data_collection}, expiration={expiration_date}, days={days_to_expiration}")
+            logger.debug(
+                f"Сохранены данные опциона {symbol} на {date_data_collection_str}, "
+                f"expiration={expiration_date}, days={days_to_expiration}"
+            )
             
         except sqlite3.Error as e:
             logger.error(f"Ошибка при сохранении данных опциона {symbol}: {e}")
@@ -503,6 +522,7 @@ class OptionDatabase:
         
         try:
             since = datetime.now() - timedelta(days=days)
+            since_local = self._format_local_datetime(since)
             
             query = """
                 SELECT date_data_collection, delta, gamma, vega, theta, iv, mark_price
@@ -510,7 +530,7 @@ class OptionDatabase:
                 WHERE symbol = ? AND date_data_collection >= ?
                 ORDER BY date_data_collection ASC
             """
-            params = (symbol, since.isoformat())
+            params = (symbol, since_local)
             
             self._log_sql_query(query, params)
             cursor.execute(query, params)
@@ -540,13 +560,14 @@ class OptionDatabase:
         
         try:
             since = datetime.now() - timedelta(days=days)
+            since_local = self._format_local_datetime(since)
             
             query = """
                 SELECT iv FROM option_history
                 WHERE symbol = ? AND date_data_collection >= ? AND iv IS NOT NULL
                 ORDER BY date_data_collection ASC
             """
-            params = (symbol, since.isoformat())
+            params = (symbol, since_local)
             
             self._log_sql_query(query, params)
             cursor.execute(query, params)
@@ -635,7 +656,8 @@ class OptionDatabase:
                   AND iv IS NOT NULL
                 ORDER BY date_data_collection ASC
             """
-            params = (underlying_ticker, days_to_expiration, since.isoformat())
+            since_local = self._format_local_datetime(since)
+            params = (underlying_ticker, days_to_expiration, since_local)
             
             self._log_sql_query(query, params)
             cursor.execute(query, params)
@@ -718,13 +740,14 @@ class OptionDatabase:
         
         try:
             since = datetime.now() - timedelta(days=days)
+            since_local = self._format_local_datetime(since)
             
             cursor.execute("""
                 SELECT timestamp, price
                 FROM underlying_history
                 WHERE symbol = ? AND timestamp >= ?
                 ORDER BY timestamp ASC
-            """, (underlying, since.isoformat()))
+            """, (underlying, since_local))
             
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
@@ -800,6 +823,7 @@ class OptionDatabase:
         
         try:
             since = datetime.now() - timedelta(days=days_back)
+            since_local = self._format_local_datetime(since)
             
             cursor.execute("""
                 SELECT * FROM option_history
@@ -807,7 +831,7 @@ class OptionDatabase:
                   AND expiration_date = ?
                   AND date_data_collection >= ?
                 ORDER BY date_data_collection ASC
-            """, (underlying_ticker, expiration_date.isoformat(), since.isoformat()))
+            """, (underlying_ticker, expiration_date.isoformat(), since_local))
             
             rows = cursor.fetchall()
             return [dict(row) for row in rows]

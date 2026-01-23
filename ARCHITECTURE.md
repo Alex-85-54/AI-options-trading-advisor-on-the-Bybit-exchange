@@ -124,7 +124,7 @@ Unit тесты для анализаторов
 CREATE TABLE option_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
-    date_data_collection DATETIME NOT NULL,  -- дата и время сбора данных (округлено до 5 минут)
+    date_data_collection DATETIME NOT NULL,  -- дата и время сбора данных (округлено до 5 минут, UTC+7)
     expiration_date DATE NOT NULL,           -- дата экспирации опциона (извлечена из symbol)
     underlying_ticker TEXT NOT NULL,          -- базовый актив (BTC, ETH, SOL)
     days_to_expiration INTEGER,               -- вычисляемое поле: expiration_date - date_data_collection
@@ -264,7 +264,7 @@ SUBSCRIPTION_CONFIG = {
     "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней
     "strike_steps_count": 7,               # ±7 шагов от текущей цены
     "daily_update_time_utc": "08:05",      # Время обновления подписок
-    "skip_today_expiration": True,         # Пропускать опционы с экспирацией сегодня
+    "skip_today_expiration": False,        # Собирать до экспирации (days_to_expiration = 0)
     "save_only_otm": True,                 # Сохранять только OTM опционы
 }
 ```
@@ -296,7 +296,7 @@ AGENT_CONFIG = {    "run_interval_minutes": 60,  # Частота запуска
 
 DATA_CONFIG = {    "save_interval_minutes": 5,      # Интервал сохранения данных из WebSocket в БД    "align_to_interval": True,       # Выравнивание времени сохранения по 5-минутным интервалам    "save_on_startup": True,         # Сохранить данные при старте сервиса    "batch_save": True,              # Батчинг запросов к БД (сохранять все символы за один запрос)    "save_only_otm": True,           # Сохранять только OTM опционы (ITM не сохраняются)}
 
-SUBSCRIPTION_CONFIG = {    "max_expiration_days": 3,              # Максимум дней до экспирации для подписки    "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней    "strike_steps_count": 7,               # ±7 шагов от текущей цены    "daily_update_time_utc": "08:05",      # Время обновления подписок (UTC)    "skip_today_expiration": True,         # Пропускать опционы с экспирацией сегодня    "new_options_time_utc": "08:00",      # Время добавления новых опционов на бирже (UTC)}
+SUBSCRIPTION_CONFIG = {    "max_expiration_days": 3,              # Максимум дней до экспирации для подписки    "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней    "strike_steps_count": 7,               # ±7 шагов от текущей цены    "daily_update_time_utc": "08:05",      # Время обновления подписок (UTC)    "skip_today_expiration": False,        # Собирать до экспирации (days_to_expiration = 0)    "new_options_time_utc": "08:00",      # Время добавления новых опционов на бирже (UTC)}
 7.4. Метрики эффективности
 Для анализа работы агента:
 Win Rate — процент прибыльных сигналов

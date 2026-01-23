@@ -37,30 +37,30 @@ SUBSCRIPTION_CONFIG = {
     "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней
     "strike_steps_count": 7,               # ±7 шагов от текущей цены
     "daily_update_time_utc": "08:05",      # Время обновления подписок (UTC)
-    "skip_today_expiration": True,         # Пропускать опционы с экспирацией сегодня
+    "skip_today_expiration": False,        # Собираем данные до экспирации (days_to_expiration = 0)
     "new_options_time_utc": "08:00",       # Время добавления новых опционов на бирже (UTC)
     "save_only_otm": True,                 # Сохранять только OTM опционы
 }
 
 # Конфигурация анализа исторических данных
 ANALYSIS_CONFIG = {
-    "iv_analysis_days": 1,                # Количество дней истории для анализа IV (процентили, IVR)
-    "greeks_analysis_days": 1,             # Количество дней истории для анализа тренда греков
+    "iv_analysis_days": 2,                # Количество дней истории для анализа IV (процентили, IVR)
+    "greeks_analysis_days": 2,             # Количество дней истории для анализа тренда греков
 }
 
 # Конфигурация стратегий анализа
 STRATEGY_CONFIG = {
     # IV Filter
-    "ivr_threshold": 25.0,                 # Порог IVR для фильтрации (опционы с IVR < threshold считаются подходящими)
+    "ivr_threshold": 50.0,                 # Порог IVR для фильтрации (опционы с IVR < threshold считаются подходящими)
     
     # Greeks Analyzer
-    "gamma_concentration_threshold": 0.3,  # Порог концентрации гаммы (доля гаммы в узком диапазоне страйков)
-    "vega_concentration_threshold": 0.3,  # Порог концентрации веги
+    "gamma_concentration_threshold": 0.1,  # Порог концентрации гаммы (доля гаммы в узком диапазоне страйков)
+    "vega_concentration_threshold": 0.1,  # Порог концентрации веги
     "skew_threshold": 0.1,                 # Порог скью для обнаружения асимметрии (абсолютное значение)
     
     # Anomaly Detector
     "volume_spike_multiplier": 2.0,        # Множитель для обнаружения всплеска объема (средний объем * multiplier)
-    "delta_imbalance_threshold": 0.2,      # Порог дисбаланса дельты (разница между Call и Put дельтами)
+    "delta_imbalance_threshold": 0.1,      # Порог дисбаланса дельты (разница между Call и Put дельтами)
 }
 
 # Конфигурация часового пояса для отображения времени
@@ -79,8 +79,8 @@ AGENT_CONFIG = {
     "run_interval_minutes": 60,            # Частота запуска агента (каждый час)
     "run_at_hour_start": True,             # Запускать в начале каждого часа (10:00, 11:00, ...)
     "max_expiration_days": 3,              # Максимальная экспирация для анализа (3 дня)
-    "ivr_threshold": 25,                   # Порог IVR для фильтрации
-    "min_confidence": 0.6,                 # Минимальная уверенность для сигнала
+    "ivr_threshold": 50,                   # Порог IVR для фильтрации
+    "min_confidence": 0.4,                 # Минимальная уверенность для сигнала
     "deepseek_api_key": _deepseek_api_key,
     "deepseek_model": "deepseek-chat",
     "deepseek_base_url": "https://api.deepseek.com",

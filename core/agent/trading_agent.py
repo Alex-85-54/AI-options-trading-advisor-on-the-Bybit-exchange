@@ -6,6 +6,7 @@ import logging
 import json
 import time
 import os
+import re
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 
@@ -20,7 +21,7 @@ except ImportError:
     RateLimitError = Exception
     logging.warning("openai library not installed. Install with: pip install openai")
 
-from config import AGENT_CONFIG
+from config import AGENT_CONFIG, STRATEGY_CONFIG
 from core.agent.prompt_templates import (
     MARKET_ANALYSIS_PROMPT,
     DECISION_PROMPT,
@@ -28,6 +29,40 @@ from core.agent.prompt_templates import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _clean_json_response(response: str) -> str:
+    """
+    Очистить ответ LLM от markdown форматирования и извлечь JSON
+    
+    Args:
+        response: Сырой ответ от LLM
+        
+    Returns:
+        Очищенная строка с JSON
+    """
+    if not response or not response.strip():
+        return ""
+    
+    cleaned = response.strip()
+    
+    # Удаляем markdown блоки кода, если они есть
+    # Паттерн: ```json ... ``` или ``` ... ```
+    json_pattern = r'```(?:json)?\s*(.*?)\s*```'
+    match = re.search(json_pattern, cleaned, re.DOTALL)
+    if match:
+        cleaned = match.group(1).strip()
+        logger.debug("Извлечен JSON из markdown блока")
+    
+    # Пытаемся найти JSON объект в тексте (на случай если есть пояснительный текст)
+    # Ищем первую открывающую скобку { и последнюю закрывающую }
+    first_brace = cleaned.find('{')
+    last_brace = cleaned.rfind('}')
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        cleaned = cleaned[first_brace:last_brace + 1]
+        logger.debug("Извлечен JSON из текста")
+    
+    return cleaned
 
 
 class TradingAgent:
@@ -264,9 +299,16 @@ class TradingAgent:
             
             # Парсим ответ (может быть JSON или текст)
             try:
-                analysis_result = json.loads(response)
+                # Пытаемся очистить и распарсить как JSON
+                cleaned_response = _clean_json_response(response)
+                if cleaned_response:
+                    analysis_result = json.loads(cleaned_response)
+                else:
+                    # Если не удалось извлечь JSON, используем исходный ответ
+                    raise json.JSONDecodeError("No JSON found", response, 0)
             except json.JSONDecodeError:
                 # Если не JSON, возвращаем как текст
+                logger.debug("Ответ LLM не является JSON, возвращаем как текст")
                 analysis_result = {
                     'summary': response,
                     'raw_response': response
@@ -318,12 +360,16 @@ class TradingAgent:
                 - risk_level: уровень риска
         """
         try:
+            # Получаем порог IVR из конфигурации
+            ivr_threshold = STRATEGY_CONFIG.get("ivr_threshold", 50.0)
+            
             # Формируем промпт для принятия решения
             prompt = DECISION_PROMPT.format(
                 market_analysis=json.dumps(context.get('market_analysis', {}), indent=2, ensure_ascii=False),
                 underlying=context.get('underlying', 'BTC'),
                 underlying_price=context.get('underlying_price', 0),
-                options_summary=json.dumps(context.get('options_summary', {}), indent=2, ensure_ascii=False)
+                options_summary=json.dumps(context.get('options_summary', {}), indent=2, ensure_ascii=False),
+                ivr_threshold=ivr_threshold
             )
             
             messages = [
@@ -342,9 +388,26 @@ class TradingAgent:
                     logger.warning("Не удалось получить решение от LLM")
                     return None
             
-            # Парсим JSON ответ
+            # Очищаем и парсим JSON ответ
             try:
-                decision = json.loads(response)
+                # Проверяем, что ответ не пустой
+                if not response or not response.strip():
+                    logger.error("LLM вернул пустой ответ")
+                    return None
+                
+                # Очищаем ответ от возможного markdown форматирования
+                cleaned_response = _clean_json_response(response)
+                
+                if not cleaned_response:
+                    logger.error("Не удалось извлечь JSON из ответа LLM")
+                    logger.error(f"Исходный ответ (первые 500 символов): {response[:500]}")
+                    return None
+                
+                # Логируем очищенный ответ для отладки
+                logger.debug(f"Очищенный ответ LLM (первые 500 символов): {cleaned_response[:500]}")
+                
+                # Парсим JSON
+                decision = json.loads(cleaned_response)
                 
                 # Валидация решения
                 signal_type = decision.get('signal_type')
@@ -389,7 +452,8 @@ class TradingAgent:
                 
             except json.JSONDecodeError as e:
                 logger.error(f"Ошибка парсинга JSON ответа от LLM: {e}")
-                logger.debug(f"Ответ LLM: {response}")
+                logger.error(f"Полный ответ LLM (первые 1000 символов): {response[:1000] if response else 'ПУСТОЙ ОТВЕТ'}")
+                logger.error(f"Очищенный ответ (первые 1000 символов): {cleaned_response[:1000] if 'cleaned_response' in locals() else 'НЕ ОЧИЩЕН'}")
                 return None
                 
         except Exception as e:
