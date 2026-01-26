@@ -38,8 +38,9 @@ from core.data.option_board import get_option_board, is_otm
 from utils.logging_config import setup_service_logging
 from utils.log_buffer import get_log_buffer_handler
 import logging
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+import threading
 
 # Настройка логирования с ротацией файлов
 print("Setting up logging...", flush=True)
@@ -82,8 +83,10 @@ SUBSCRIPTION_UPDATE_MINUTE = 5
 
 # Глобальные объекты
 option_board = get_option_board()
-subscription_scheduler = BackgroundScheduler(timezone=DISPLAY_TIMEZONE)
+subscription_scheduler = AsyncIOScheduler(timezone=DISPLAY_TIMEZONE)
 last_subscription_refresh: Optional[datetime] = None
+next_subscription_run: Optional[datetime] = None
+subscription_lock = threading.Lock()
 
 
 def refresh_option_subscriptions() -> Dict[str, int]:
@@ -91,8 +94,12 @@ def refresh_option_subscriptions() -> Dict[str, int]:
     Переподписка на опционы (обновление списка активных символов).
     Использует доску опционов и переподключает WebSocket.
     """
+    if not subscription_lock.acquire(blocking=False):
+        logger.warning("⚠️ Переподписка уже выполняется, пропускаем новый запуск")
+        return {"old_count": len(ws_manager.active_symbols), "new_count": len(ws_manager.active_symbols)}
     try:
         global last_subscription_refresh
+        last_subscription_refresh = datetime.now(DISPLAY_TIMEZONE)
         logger.info("🔄 Запуск переподписки на опционы (UTC+7)")
         all_symbols: List[str] = []
         max_days = SUBSCRIPTION_CONFIG.get("max_expiration_days", 3)
@@ -117,19 +124,29 @@ def refresh_option_subscriptions() -> Dict[str, int]:
         old_count = len(ws_manager.active_symbols)
         ws_manager.update_subscriptions(unique_symbols)
         new_count = len(ws_manager.active_symbols)
-        last_subscription_refresh = datetime.now(DISPLAY_TIMEZONE)
+        # Обновляем время следующей переподписки
+        try:
+            job = subscription_scheduler.get_job("daily_subscription_update")
+            if job:
+                global next_subscription_run
+                next_subscription_run = job.next_run_time
+        except Exception:
+            pass
+
         logger.info(f"✅ Подписки обновлены: было {old_count}, стало {new_count}")
         return {"old_count": old_count, "new_count": new_count}
     except Exception as e:
         logger.error(f"Ошибка при переподписке на опционы: {e}", exc_info=True)
         return {"old_count": len(ws_manager.active_symbols), "new_count": len(ws_manager.active_symbols)}
+    finally:
+        subscription_lock.release()
 
 
 @app.on_event("startup")
 async def startup_event():
     """Запуск планировщика переподписки"""
     if not subscription_scheduler.running:
-        subscription_scheduler.add_job(
+        job = subscription_scheduler.add_job(
             refresh_option_subscriptions,
             trigger=CronTrigger(
                 hour=SUBSCRIPTION_UPDATE_HOUR,
@@ -138,11 +155,16 @@ async def startup_event():
             ),
             id="daily_subscription_update",
             replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
         )
         subscription_scheduler.start()
         logger.info(
             f"🕒 Планировщик переподписки запущен (ежедневно в {SUBSCRIPTION_UPDATE_HOUR:02d}:{SUBSCRIPTION_UPDATE_MINUTE:02d} UTC+7)"
         )
+        global next_subscription_run
+        next_subscription_run = job.next_run_time
+        logger.info(f"⏭️ Следующая переподписка: {next_subscription_run}")
     # Первичная подписка при старте, чтобы админ-панель сразу показывала актуальные данные
     refresh_option_subscriptions()
 
@@ -410,6 +432,7 @@ async def get_application_status():
             "active_symbols_count": len(ws_manager.active_symbols),
             "otm_subscribed_count": otm_subscribed_count,
             "last_resubscribe": format_datetime_local(last_subscription_refresh) if last_subscription_refresh else None,
+            "next_resubscribe": format_datetime_local(next_subscription_run) if next_subscription_run else None,
             "active_symbols": list(ws_manager.active_symbols)[:50]  # Первые 50 для просмотра
         }
         

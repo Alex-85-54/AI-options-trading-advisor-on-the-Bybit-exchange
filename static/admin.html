@@ -425,6 +425,13 @@
                     html += '<span class="config-value">' + data.websocket.last_resubscribe + '</span>';
                     html += '</div>';
                 }
+
+                if (data.websocket.next_resubscribe) {
+                    html += '<div class="service-item">';
+                    html += '<div class="service-name">Следующая переподписка (UTC+7)</div>';
+                    html += '<span class="config-value">' + data.websocket.next_resubscribe + '</span>';
+                    html += '</div>';
+                }
                 
                 html += '<div class="service-item">';
                 html += '<div class="service-name">Опций в памяти</div>';
