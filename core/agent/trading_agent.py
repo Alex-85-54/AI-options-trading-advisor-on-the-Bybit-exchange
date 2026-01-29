@@ -361,7 +361,9 @@ class TradingAgent:
         """
         try:
             # Получаем порог IVR из конфигурации
-            ivr_threshold = STRATEGY_CONFIG.get("ivr_threshold", 50.0)
+            ivr_threshold = context.get("ivr_threshold")
+            if ivr_threshold is None:
+                ivr_threshold = STRATEGY_CONFIG.get("ivr_threshold", 50.0)
             
             # Формируем промпт для принятия решения
             prompt = DECISION_PROMPT.format(

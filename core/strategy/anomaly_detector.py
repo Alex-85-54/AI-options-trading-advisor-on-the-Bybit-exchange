@@ -38,7 +38,12 @@ class AnomalyDetector:
             pass
         return None
     
-    def detect_volume_spikes(self, options_data: Dict[str, Dict]) -> Dict:
+    def detect_volume_spikes(
+        self,
+        options_data: Dict[str, Dict],
+        threshold: Optional[float] = None,
+        multiplier: Optional[float] = None
+    ) -> Dict:
         """
         Обнаружить всплески объема
         
@@ -78,12 +83,17 @@ class AnomalyDetector:
             
             avg_volume = statistics.mean(volumes)
             max_volume = max(volumes)
-            threshold = avg_volume * self.volume_spike_multiplier
+            if threshold is None:
+                multiplier_value = self.volume_spike_multiplier if multiplier is None else multiplier
+                threshold_value = avg_volume * multiplier_value
+            else:
+                multiplier_value = None
+                threshold_value = threshold
             
             # Находим опционы с аномальным объемом
             spikes = [
                 symbol for symbol, volume in volume_by_symbol.items()
-                if volume >= threshold
+                if volume >= threshold_value
             ]
             
             result = {
@@ -91,8 +101,8 @@ class AnomalyDetector:
                 'avg_volume': avg_volume,
                 'max_volume': max_volume,
                 'spike_count': len(spikes),
-                'threshold': threshold,
-                'multiplier': self.volume_spike_multiplier
+                'threshold': threshold_value,
+                'multiplier': multiplier_value
             }
             
             if spikes:
@@ -113,7 +123,7 @@ class AnomalyDetector:
                 'error': str(e)
             }
     
-    def detect_delta_imbalance(self, options_data: Dict[str, Dict]) -> Dict:
+    def detect_delta_imbalance(self, options_data: Dict[str, Dict], threshold: Optional[float] = None) -> Dict:
         """
         Обнаружить дисбаланс дельты между Call и Put опционами
         
@@ -168,14 +178,15 @@ class AnomalyDetector:
             imbalance = (call_total_delta - put_total_delta) / total_delta
             
             # Определяем направление
-            if abs(imbalance) < self.delta_imbalance_threshold:
+            threshold_value = self.delta_imbalance_threshold if threshold is None else threshold
+            if abs(imbalance) < threshold_value:
                 direction = 'balanced'
             elif imbalance > 0:
                 direction = 'call'
             else:
                 direction = 'put'
             
-            is_imbalanced = abs(imbalance) >= self.delta_imbalance_threshold
+            is_imbalanced = abs(imbalance) >= threshold_value
             
             result = {
                 'imbalance': imbalance,
@@ -185,7 +196,7 @@ class AnomalyDetector:
                 'put_count': put_count,
                 'is_imbalanced': is_imbalanced,
                 'direction': direction,
-                'threshold': self.delta_imbalance_threshold
+                'threshold': threshold_value
             }
             
             if is_imbalanced:
@@ -208,7 +219,7 @@ class AnomalyDetector:
                 'error': str(e)
             }
     
-    def detect_all_anomalies(self, options_data: Dict[str, Dict]) -> Dict:
+    def detect_all_anomalies(self, options_data: Dict[str, Dict], thresholds: Optional[Dict[str, float]] = None) -> Dict:
         """
         Обнаружить все типы аномалий
         
@@ -218,9 +229,16 @@ class AnomalyDetector:
         Returns:
             Словарь со всеми обнаруженными аномалиями
         """
+        volume_threshold = thresholds.get("volume_spike_threshold") if thresholds else None
+        volume_multiplier = thresholds.get("volume_spike_multiplier") if thresholds else None
+        delta_threshold = thresholds.get("delta_imbalance_threshold") if thresholds else None
         return {
-            'volume_spikes': self.detect_volume_spikes(options_data),
-            'delta_imbalance': self.detect_delta_imbalance(options_data)
+            'volume_spikes': self.detect_volume_spikes(
+                options_data,
+                threshold=volume_threshold,
+                multiplier=volume_multiplier
+            ),
+            'delta_imbalance': self.detect_delta_imbalance(options_data, threshold=delta_threshold)
         }
 
 

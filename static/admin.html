@@ -288,6 +288,28 @@
                 </div>
             </div>
 
+            <!-- Динамические пороги -->
+            <div class="card">
+                <h2>📈 Динамические пороги</h2>
+                <button class="btn" onclick="refreshThresholds()">Обновить</button>
+                <button class="btn btn-secondary" onclick="recalculateThresholds()">Пересчитать</button>
+                <div id="thresholdsPanel">
+                    <div class="loading">Нажмите "Обновить" для загрузки</div>
+                </div>
+            </div>
+
+            <!-- Активные пороги -->
+            <div class="card">
+                <h2>🎯 Активные пороги</h2>
+                <div style="margin-bottom: 10px;">
+                    <input id="activeUnderlying" type="text" placeholder="BTC" style="padding:8px; border-radius:6px; border:1px solid #e5e7eb; margin-right:8px; width:80px;">
+                    <button class="btn" onclick="refreshActiveThresholds()">Обновить</button>
+                </div>
+                <div id="activeThresholdsPanel">
+                    <div class="loading">Введите underlying и нажмите "Обновить"</div>
+                </div>
+            </div>
+
             <!-- Статус приложения -->
             <div class="card">
                 <h2>⚙️ Статус приложения</h2>
@@ -516,6 +538,127 @@
         function refreshDbStats() {
             document.getElementById('dbStats').innerHTML = '<div class="loading">Обновление...</div>';
             loadDbStats();
+        }
+
+        // Обновление динамических порогов
+        function refreshThresholds() {
+            document.getElementById('thresholdsPanel').innerHTML = '<div class="loading">Обновление...</div>';
+            loadThresholds();
+        }
+
+        // Ручной пересчет динамических порогов
+        async function recalculateThresholds() {
+            try {
+                const response = await fetch('/admin/api/thresholds/recalculate', { method: 'POST' });
+                const data = await response.json();
+                if (data.status !== 'ok') {
+                    document.getElementById('thresholdsPanel').innerHTML =
+                        '<div style="color: #f59e0b;">' + (data.message || 'Пересчет завершен') + '</div>';
+                }
+                loadThresholds();
+            } catch (error) {
+                document.getElementById('thresholdsPanel').innerHTML =
+                    '<div style="color: #ef4444;">Ошибка пересчета: ' + error.message + '</div>';
+            }
+        }
+
+        // Загрузка активных порогов
+        async function loadActiveThresholds(underlying) {
+            try {
+                const response = await fetch('/admin/api/thresholds/active?underlying=' + encodeURIComponent(underlying));
+                const data = await response.json();
+                if (data.status !== 'ok') {
+                    document.getElementById('activeThresholdsPanel').innerHTML =
+                        '<div style="color: #f59e0b;">' + (data.message || 'Нет данных') + '</div>';
+                    return;
+                }
+
+                let html = '';
+                html += '<div class="config-item"><span class="config-label">Underlying:</span><span class="config-value">' +
+                    data.underlying + '</span></div>';
+                html += '<div class="config-item"><span class="config-label">DTE бин:</span><span class="config-value">' +
+                    (data.dte_bucket || '-') + '</span></div>';
+                const badge = data.active_type === 'dynamic' ? 'success' : 'warning';
+                const label = data.active_type === 'dynamic' ? 'динамические' : 'статические';
+                html += '<div class="config-item"><span class="config-label">Тип порогов:</span><span class="badge ' + badge + '">' + label + '</span></div>';
+
+                html += '<h3 style="margin-top: 15px; color: #667eea;">Пороги</h3>';
+                for (const [key, value] of Object.entries(data.thresholds || {})) {
+                    html += '<div class="config-item"><span class="config-label">' + key + ':</span><span class="config-value">' +
+                        value + '</span></div>';
+                }
+                html += '<div class="refresh-info">Обновлено: ' + data.timestamp + '</div>';
+                document.getElementById('activeThresholdsPanel').innerHTML = html;
+            } catch (error) {
+                document.getElementById('activeThresholdsPanel').innerHTML =
+                    '<div style="color: #ef4444;">Ошибка загрузки: ' + error.message + '</div>';
+            }
+        }
+
+        function refreshActiveThresholds() {
+            const underlying = (document.getElementById('activeUnderlying').value || '').trim().toUpperCase();
+            if (!underlying) {
+                document.getElementById('activeThresholdsPanel').innerHTML =
+                    '<div style="color: #f59e0b;">Введите underlying (например, BTC)</div>';
+                return;
+            }
+            document.getElementById('activeThresholdsPanel').innerHTML = '<div class="loading">Обновление...</div>';
+            loadActiveThresholds(underlying);
+        }
+
+        // Загрузка динамических порогов
+        async function loadThresholds() {
+            try {
+                const response = await fetch('/admin/api/thresholds');
+                const data = await response.json();
+
+                let html = '';
+                const enabledBadge = data.dynamic_enabled ? 
+                    '<span class="badge success">включены</span>' : 
+                    '<span class="badge warning">выключены</span>';
+                html += '<div class="config-item"><span class="config-label">Динамические пороги:</span>' + enabledBadge + '</div>';
+
+                // Статические пороги (fallback)
+                html += '<h3 style="margin-top: 15px; color: #667eea;">Статические (fallback)</h3>';
+                const staticKeys = Object.keys(data.static_thresholds || {});
+                if (staticKeys.length === 0) {
+                    html += '<div class="loading">Нет данных</div>';
+                } else {
+                    staticKeys.forEach(key => {
+                        html += '<div class="config-item"><span class="config-label">' + key + ':</span><span class="config-value">' +
+                            data.static_thresholds[key] + '</span></div>';
+                    });
+                }
+
+                // Динамические пороги
+                html += '<h3 style="margin-top: 15px; color: #667eea;">Динамические (активные)</h3>';
+                const thresholds = data.dynamic_thresholds || [];
+                if (!thresholds.length) {
+                    html += '<div class="loading">Нет динамических порогов в БД. Используются статические.</div>';
+                } else {
+                    html += '<div style="overflow-x:auto;"><table style="width:100%; border-collapse: collapse; font-size: 12px;">';
+                    html += '<tr style="text-align:left; color:#6b7280;">' +
+                        '<th>Актив</th><th>DTE бин</th><th>Метрика</th><th>Значение</th><th>Выборка</th><th>Метод</th><th>Обновлено</th></tr>';
+                    thresholds.forEach(row => {
+                        html += '<tr>' +
+                            '<td>' + row.underlying + '</td>' +
+                            '<td>' + row.dte_bucket + '</td>' +
+                            '<td>' + row.metric + '</td>' +
+                            '<td>' + Number(row.value).toFixed(4) + '</td>' +
+                            '<td>' + row.sample_size + '</td>' +
+                            '<td>' + row.method + '</td>' +
+                            '<td>' + (row.computed_at || '-') + '</td>' +
+                            '</tr>';
+                    });
+                    html += '</table></div>';
+                    html += '<div class="refresh-info">Если для конкретного актива/бина нет динамики, используется статический порог.</div>';
+                }
+
+                document.getElementById('thresholdsPanel').innerHTML = html;
+            } catch (error) {
+                document.getElementById('thresholdsPanel').innerHTML =
+                    '<div style="color: #ef4444;">Ошибка загрузки: ' + error.message + '</div>';
+            }
         }
 
         // Подключение к WebSocket для логов

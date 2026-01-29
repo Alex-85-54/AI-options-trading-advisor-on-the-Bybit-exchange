@@ -233,8 +233,20 @@ class OptionWebSocketManager:
     def disconnect(self):
         """Отключить WebSocket"""
         if self.ws:
-            self.ws.close()
-            self.is_connected = False
+            try:
+                if hasattr(self.ws, "close"):
+                    self.ws.close()
+                elif hasattr(self.ws, "stop"):
+                    self.ws.stop()
+                elif hasattr(self.ws, "exit"):
+                    self.ws.exit()
+                else:
+                    logger.warning("WebSocket object has no close/stop/exit method")
+            except Exception as e:
+                logger.error(f"Ошибка при отключении WebSocket: {e}", exc_info=True)
+            finally:
+                self.is_connected = False
+                self.ws = None
             logger.info("WebSocket disconnected")
 
     def update_subscriptions(self, symbols: List[str]):

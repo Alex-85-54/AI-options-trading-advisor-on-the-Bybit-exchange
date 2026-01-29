@@ -263,7 +263,7 @@ SUBSCRIPTION_CONFIG = {
     "max_expiration_days": 3,              # Максимум дней до экспирации
     "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней
     "strike_steps_count": 7,               # ±7 шагов от текущей цены
-    "daily_update_time_utc": "08:05",      # Время обновления подписок
+    "daily_update_time_utc": "15:05",      # Время обновления подписок
     "skip_today_expiration": False,        # Собирать до экспирации (days_to_expiration = 0)
     "save_only_otm": True,                 # Сохранять только OTM опционы
 }
@@ -296,7 +296,7 @@ AGENT_CONFIG = {    "run_interval_minutes": 60,  # Частота запуска
 
 DATA_CONFIG = {    "save_interval_minutes": 5,      # Интервал сохранения данных из WebSocket в БД    "align_to_interval": True,       # Выравнивание времени сохранения по 5-минутным интервалам    "save_on_startup": True,         # Сохранить данные при старте сервиса    "batch_save": True,              # Батчинг запросов к БД (сохранять все символы за один запрос)    "save_only_otm": True,           # Сохранять только OTM опционы (ITM не сохраняются)}
 
-SUBSCRIPTION_CONFIG = {    "max_expiration_days": 3,              # Максимум дней до экспирации для подписки    "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней    "strike_steps_count": 7,               # ±7 шагов от текущей цены    "daily_update_time_utc": "08:05",      # Время обновления подписок (UTC)    "skip_today_expiration": False,        # Собирать до экспирации (days_to_expiration = 0)    "new_options_time_utc": "08:00",      # Время добавления новых опционов на бирже (UTC)}
+SUBSCRIPTION_CONFIG = {    "max_expiration_days": 3,              # Максимум дней до экспирации для подписки    "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней    "strike_steps_count": 7,               # ±7 шагов от текущей цены    "daily_update_time_utc": "15:05",      # Время обновления подписок (UTC)    "skip_today_expiration": False,        # Собирать до экспирации (days_to_expiration = 0)    "new_options_time_utc": "15:05",      # Время добавления новых опционов на бирже (UTC)}
 7.4. Метрики эффективности
 Для анализа работы агента:
 Win Rate — процент прибыльных сигналов
@@ -382,5 +382,26 @@ def get_next_save_time(current_time):
   - `days_to_expiration` - вычисляется как expiration_date - date_data_collection
 - При ошибке сохранения - логировать, но продолжать работу
 - Первое сохранение происходит при старте сервиса (сразу или в ближайший 5-минутный интервал)
+
+7.8. Динамические пороги стратегии
+Добавлена таблица `strategy_thresholds` для хранения динамически рассчитанных порогов по каждому активу и DTE-бину.
+
+```sql
+CREATE TABLE strategy_thresholds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    underlying TEXT NOT NULL,
+    dte_bucket TEXT NOT NULL,      -- бин по days_to_expiration (например, '0-1', '2-3', '31-60')
+    metric TEXT NOT NULL,          -- имя порога (например, 'skew_threshold')
+    value REAL NOT NULL,           -- рассчитанное значение порога
+    sample_size INTEGER NOT NULL,  -- размер выборки
+    method TEXT NOT NULL,          -- метод расчета (например, 'pct_85')
+    computed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(underlying, dte_bucket, metric)
+);
+CREATE INDEX idx_strategy_thresholds_underlying ON strategy_thresholds(underlying);
+CREATE INDEX idx_strategy_thresholds_bucket ON strategy_thresholds(dte_bucket);
+```
+
+Порог пересчитывается периодически (по конфигурации) и используется вместо статических значений, с fallback на `STRATEGY_CONFIG` при недостатке данных.
 
 **Важно:** Существующие данные в БД не мигрируются. Новая структура применяется для новых данных, начиная с момента обновления схемы БД.

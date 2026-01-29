@@ -12,6 +12,7 @@ from core.data.historical_analyzer import get_historical_analyzer
 from core.strategy.iv_filter import get_iv_filter
 from core.strategy.greeks_analyzer import get_greeks_analyzer
 from core.strategy.anomaly_detector import get_anomaly_detector
+from core.strategy.dynamic_thresholds import DynamicThresholds
 from core.agent.trading_agent import get_trading_agent
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ class DecisionEngine:
         self.iv_filter = get_iv_filter()
         self.greeks_analyzer = get_greeks_analyzer()
         self.anomaly_detector = get_anomaly_detector()
+        self.dynamic_thresholds = DynamicThresholds()
         self.agent = get_trading_agent()
         
         self.max_expiration_days = AGENT_CONFIG.get("max_expiration_days", 3)
@@ -143,23 +145,32 @@ class DecisionEngine:
                     'error': 'No options data'
                 }
             
+            # Получаем динамические пороги (если доступны)
+            thresholds = self.dynamic_thresholds.get_thresholds_for_options(underlying, options_data)
+
             # Анализ IVR для каждого опциона
             # Используем новый подход с похожими опционами
             ivr_analysis = {}
+            ivr_threshold = thresholds.get("ivr_threshold") if thresholds else None
             for symbol, data in options_data.items():
                 # Передаем данные опциона для получения текущей IV
-                ivr_info = self.iv_filter.get_ivr_info(symbol, option_data=data)
+                ivr_info = self.iv_filter.get_ivr_info(
+                    symbol,
+                    option_data=data,
+                    threshold=ivr_threshold
+                )
                 if ivr_info.get('ivr') is not None:
                     ivr_analysis[symbol] = ivr_info
-            
+
             # Анализ распределения греков
             greeks_analysis = self.greeks_analyzer.analyze_all(
                 options_data,
-                collected_data.get('underlying_price')
+                collected_data.get('underlying_price'),
+                thresholds=thresholds
             )
             
             # Обнаружение аномалий
-            anomalies = self.anomaly_detector.detect_all_anomalies(options_data)
+            anomalies = self.anomaly_detector.detect_all_anomalies(options_data, thresholds=thresholds)
             
             # Формируем сводку для опционов
             options_summary = self._create_options_summary(options_data, ivr_analysis)
@@ -168,7 +179,8 @@ class DecisionEngine:
                 'ivr_analysis': ivr_analysis,
                 'greeks_analysis': greeks_analysis,
                 'anomalies': anomalies,
-                'options_summary': options_summary
+                'options_summary': options_summary,
+                'ivr_threshold': ivr_threshold
             }
             
             logger.info(
@@ -283,6 +295,12 @@ class DecisionEngine:
                 logger.error(f"Ошибка при сборе данных: {collected_data.get('error')}")
                 return None
             
+            # Пересчет динамических порогов (если требуется)
+            self.dynamic_thresholds.ensure_thresholds(
+                underlying,
+                collected_data.get('options_data', {})
+            )
+
             # Шаг 2: Анализ данных
             analysis_results = self.analyze_data(collected_data)
             
@@ -316,7 +334,8 @@ class DecisionEngine:
                 'underlying': underlying,
                 'underlying_price': collected_data.get('underlying_price', 0),
                 'market_analysis': market_analysis,
-                'options_summary': analysis_results.get('options_summary', {})
+                'options_summary': analysis_results.get('options_summary', {}),
+                'ivr_threshold': analysis_results.get('ivr_threshold')
             }
             
             # Шаг 6: Принятие решения через LLM

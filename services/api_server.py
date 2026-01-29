@@ -28,6 +28,8 @@ from config import (
     DATA_CONFIG,
     SUBSCRIPTION_CONFIG,
     ANALYSIS_CONFIG,
+    DYNAMIC_THRESHOLD_CONFIG,
+    DTE_BINS,
     format_datetime_local,
     DISPLAY_TIMEZONE,
 )
@@ -35,6 +37,7 @@ from services.websocket_manager import ws_manager
 from services.data_store import data_store
 from core.data.database import get_database
 from core.data.option_board import get_option_board, is_otm
+from core.strategy.dynamic_thresholds import DynamicThresholds
 from utils.logging_config import setup_service_logging
 from utils.log_buffer import get_log_buffer_handler
 import logging
@@ -78,11 +81,23 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Настройки подписок и времени (UTC+7)
 UNDERLYING_ASSETS = ["BTC"]
-SUBSCRIPTION_UPDATE_HOUR = 15
-SUBSCRIPTION_UPDATE_MINUTE = 5
+
+# Время обновления подписок берется из конфига (формат "HH:MM")
+_subscription_time = SUBSCRIPTION_CONFIG.get("daily_update_time_utc", "08:05")
+try:
+    _subscription_parts = _subscription_time.split(":")
+    SUBSCRIPTION_UPDATE_HOUR = int(_subscription_parts[0])
+    SUBSCRIPTION_UPDATE_MINUTE = int(_subscription_parts[1])
+except (ValueError, IndexError):
+    logger.warning(
+        f"Некорректный формат daily_update_time_utc='{_subscription_time}', используем 08:05"
+    )
+    SUBSCRIPTION_UPDATE_HOUR = 8
+    SUBSCRIPTION_UPDATE_MINUTE = 5
 
 # Глобальные объекты
 option_board = get_option_board()
+dynamic_thresholds = DynamicThresholds()
 subscription_scheduler = AsyncIOScheduler(timezone=DISPLAY_TIMEZONE)
 last_subscription_refresh: Optional[datetime] = None
 next_subscription_run: Optional[datetime] = None
@@ -142,12 +157,20 @@ def refresh_option_subscriptions() -> Dict[str, int]:
         subscription_lock.release()
 
 
+async def refresh_option_subscriptions_async() -> Dict[str, int]:
+    """
+    Асинхронный безопасный запуск переподписки.
+    Выполняем в отдельном потоке, чтобы не блокировать event loop.
+    """
+    return await asyncio.to_thread(refresh_option_subscriptions)
+
+
 @app.on_event("startup")
 async def startup_event():
     """Запуск планировщика переподписки"""
     if not subscription_scheduler.running:
         job = subscription_scheduler.add_job(
-            refresh_option_subscriptions,
+            refresh_option_subscriptions_async,
             trigger=CronTrigger(
                 hour=SUBSCRIPTION_UPDATE_HOUR,
                 minute=SUBSCRIPTION_UPDATE_MINUTE,
@@ -166,7 +189,7 @@ async def startup_event():
         next_subscription_run = job.next_run_time
         logger.info(f"⏭️ Следующая переподписка: {next_subscription_run}")
     # Первичная подписка при старте, чтобы админ-панель сразу показывала актуальные данные
-    refresh_option_subscriptions()
+    await refresh_option_subscriptions_async()
 
 
 @app.on_event("shutdown")
@@ -372,6 +395,97 @@ async def get_strategy_config():
         "subscription_config": SUBSCRIPTION_CONFIG,
         "analysis_config": ANALYSIS_CONFIG
     }
+
+
+@app.get("/admin/api/thresholds")
+async def get_dynamic_thresholds():
+    """Получить динамические пороги стратегии"""
+    try:
+        db = get_database()
+        thresholds = db.get_all_strategy_thresholds()
+        static_thresholds = {
+            "ivr_threshold": STRATEGY_CONFIG.get("ivr_threshold"),
+            "gamma_concentration_threshold": STRATEGY_CONFIG.get("gamma_concentration_threshold"),
+            "vega_concentration_threshold": STRATEGY_CONFIG.get("vega_concentration_threshold"),
+            "skew_threshold": STRATEGY_CONFIG.get("skew_threshold"),
+            "volume_spike_multiplier": STRATEGY_CONFIG.get("volume_spike_multiplier"),
+            "delta_imbalance_threshold": STRATEGY_CONFIG.get("delta_imbalance_threshold"),
+        }
+        return {
+            "dynamic_enabled": DYNAMIC_THRESHOLD_CONFIG.get("enabled", True),
+            "dynamic_thresholds": thresholds,
+            "static_thresholds": static_thresholds,
+            "dte_bins": DTE_BINS,
+            "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
+        }
+    except Exception as e:
+        logger.error(f"Error getting dynamic thresholds: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/api/thresholds/recalculate")
+async def recalculate_thresholds(underlying: Optional[str] = None, dte_bucket: Optional[str] = None):
+    """
+    Ручной пересчет динамических порогов.
+    Если underlying не задан - пересчитывает по всем активам из data_store.
+    """
+    try:
+        targets = []
+        if underlying:
+            targets = [underlying]
+        else:
+            targets = list(data_store.get_all().keys())
+            # Преобразуем список символов в уникальные underlying
+            underlyings = set()
+            for symbol in targets:
+                parts = symbol.split("-")
+                if parts:
+                    underlyings.add(parts[0])
+            targets = sorted(list(underlyings))
+        if not targets:
+            return {"status": "skipped", "message": "Нет активных underlying для пересчета"}
+        for item in targets:
+            dynamic_thresholds.recalculate_for_underlying(item, dte_bucket=dte_bucket)
+        return {
+            "status": "ok",
+            "underlyings": targets,
+            "dte_bucket": dte_bucket,
+            "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
+        }
+    except Exception as e:
+        logger.error(f"Error recalculating thresholds: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/api/thresholds/active")
+async def get_active_thresholds(underlying: str):
+    """
+    Получить активные пороги для underlying + актуальный DTE-бин из data_store.
+    """
+    try:
+        options = data_store.get_by_underlying(underlying)
+        if not options:
+            return {
+                "status": "not_found",
+                "underlying": underlying,
+                "message": "Нет данных в data_store"
+            }
+        dte_bucket = dynamic_thresholds._primary_bucket_from_options(options)
+        thresholds = dynamic_thresholds.get_thresholds_for_options(underlying, options)
+        dynamic = get_database().get_strategy_thresholds(underlying, dte_bucket) if dte_bucket else {}
+        active_type = "dynamic" if dynamic else "static"
+        return {
+            "status": "ok",
+            "underlying": underlying,
+            "dte_bucket": dte_bucket,
+            "active_type": active_type,
+            "thresholds": thresholds,
+            "dynamic_thresholds": dynamic,
+            "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
+        }
+    except Exception as e:
+        logger.error(f"Error getting active thresholds: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/admin/api/status")

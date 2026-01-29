@@ -19,7 +19,12 @@ class IVFilter:
         self.analyzer = get_historical_analyzer()
         self.ivr_threshold = STRATEGY_CONFIG.get("ivr_threshold", 25.0)
     
-    def check_ivr(self, symbol: str, option_data: Optional[Dict] = None) -> Optional[bool]:
+    def check_ivr(
+        self,
+        symbol: str,
+        option_data: Optional[Dict] = None,
+        threshold: Optional[float] = None
+    ) -> Optional[bool]:
         """
         Проверить, проходит ли опцион фильтр по IVR
         
@@ -48,11 +53,12 @@ class IVFilter:
                 logger.debug(f"Не удалось вычислить IVR для {symbol}")
                 return None
             
-            passes = ivr < self.ivr_threshold
+            threshold_value = self.ivr_threshold if threshold is None else threshold
+            passes = ivr < threshold_value
             
             logger.debug(
                 f"IVR фильтр для {symbol}: IVR={ivr:.2f}%, "
-                f"threshold={self.ivr_threshold}%, passes={passes}"
+                f"threshold={threshold_value}%, passes={passes}"
             )
             
             return passes
@@ -61,7 +67,7 @@ class IVFilter:
             logger.error(f"Ошибка при проверке IVR для {symbol}: {e}", exc_info=True)
             return None
     
-    def filter_options(self, options_data: Dict[str, Dict]) -> Dict[str, Dict]:
+    def filter_options(self, options_data: Dict[str, Dict], threshold: Optional[float] = None) -> Dict[str, Dict]:
         """
         Отфильтровать опционы по IVR
         
@@ -75,7 +81,7 @@ class IVFilter:
         
         for symbol, data in options_data.items():
             # Передаем данные опциона для получения текущей IV
-            if self.check_ivr(symbol, option_data=data):
+            if self.check_ivr(symbol, option_data=data, threshold=threshold):
                 filtered[symbol] = data
         
         logger.info(
@@ -85,7 +91,12 @@ class IVFilter:
         
         return filtered
     
-    def get_ivr_info(self, symbol: str, option_data: Optional[Dict] = None) -> Dict:
+    def get_ivr_info(
+        self,
+        symbol: str,
+        option_data: Optional[Dict] = None,
+        threshold: Optional[float] = None
+    ) -> Dict:
         """
         Получить информацию об IVR для опциона
         
@@ -116,13 +127,14 @@ class IVFilter:
                 'message': 'Недостаточно данных для расчета IVR'
             }
         
-        passes = ivr < self.ivr_threshold
+        threshold_value = self.ivr_threshold if threshold is None else threshold
+        passes = ivr < threshold_value
         
         return {
             'ivr': ivr,
-            'threshold': self.ivr_threshold,
+            'threshold': threshold_value,
             'passes': passes,
-            'message': f"IVR {ivr:.2f}% {'<' if passes else '>='} {self.ivr_threshold}%"
+            'message': f"IVR {ivr:.2f}% {'<' if passes else '>='} {threshold_value}%"
         }
 
 

@@ -33,25 +33,25 @@ DATA_SAVE_ALIGN_TO_INTERVAL = True  # Выравнивание по 5-минут
 
 # Конфигурация подписок на опционы
 SUBSCRIPTION_CONFIG = {
-    "max_expiration_days": 3,              # Максимум дней до экспирации для подписки
+    "max_expiration_days": 365,              # Максимум дней до экспирации для подписки
     "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней
     "strike_steps_count": 7,               # ±7 шагов от текущей цены
-    "daily_update_time_utc": "08:05",      # Время обновления подписок (UTC)
+    "daily_update_time_utc": "15:05",      # Время обновления подписок 
     "skip_today_expiration": False,        # Собираем данные до экспирации (days_to_expiration = 0)
-    "new_options_time_utc": "08:00",       # Время добавления новых опционов на бирже (UTC)
+    "new_options_time_utc": "15:05",       # Время добавления новых опционов на бирже
     "save_only_otm": True,                 # Сохранять только OTM опционы
 }
 
 # Конфигурация анализа исторических данных
 ANALYSIS_CONFIG = {
-    "iv_analysis_days": 2,                # Количество дней истории для анализа IV (процентили, IVR)
-    "greeks_analysis_days": 2,             # Количество дней истории для анализа тренда греков
+    "iv_analysis_days": 7,                # Количество дней истории для анализа IV (процентили, IVR)
+    "greeks_analysis_days": 7,             # Количество дней истории для анализа тренда греков
 }
 
 # Конфигурация стратегий анализа
 STRATEGY_CONFIG = {
     # IV Filter
-    "ivr_threshold": 50.0,                 # Порог IVR для фильтрации (опционы с IVR < threshold считаются подходящими)
+    "ivr_threshold": 40.0,                 # Порог IVR для фильтрации (опционы с IVR < threshold считаются подходящими)
     
     # Greeks Analyzer
     "gamma_concentration_threshold": 0.1,  # Порог концентрации гаммы (доля гаммы в узком диапазоне страйков)
@@ -62,6 +62,36 @@ STRATEGY_CONFIG = {
     "volume_spike_multiplier": 2.0,        # Множитель для обнаружения всплеска объема (средний объем * multiplier)
     "delta_imbalance_threshold": 0.1,      # Порог дисбаланса дельты (разница между Call и Put дельтами)
 }
+
+# Конфигурация динамических порогов (рассчитываются по истории в БД)
+DYNAMIC_THRESHOLD_CONFIG = {
+    "enabled": True,
+    "lookback_days": 7,                  # Окно истории для расчета
+    "recalc_interval_hours": 24,          # Переcчет не чаще чем раз в N часов
+    "min_sample_size": 50,                # Минимум точек для расчета (иначе fallback на STRATEGY_CONFIG)
+    "percentiles": {
+        "ivr_threshold": 85,
+        "delta_imbalance": 85,
+        "skew": 85,
+        "volume_spike": 95,
+        "gamma_concentration": 85,
+        "vega_concentration": 85
+    }
+}
+
+# Бины DTE (days_to_expiration) для динамических порогов
+DTE_BINS = [
+    {"label": "0-1", "min": 0, "max": 1},
+    {"label": "2-3", "min": 2, "max": 3},
+    {"label": "4-7", "min": 4, "max": 7},
+    {"label": "8-14", "min": 8, "max": 14},
+    {"label": "15-30", "min": 15, "max": 30},
+    {"label": "31-60", "min": 31, "max": 60},
+    {"label": "61-120", "min": 61, "max": 120},
+    {"label": "121-200", "min": 121, "max": 200},
+    {"label": "201-365", "min": 201, "max": 365},
+    {"label": "366+", "min": 366, "max": None}
+]
 
 # Конфигурация часового пояса для отображения времени
 # Часовой пояс для отображения времени пользователю (по умолчанию UTC+7)
@@ -78,15 +108,14 @@ _deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip().strip('"').strip("
 AGENT_CONFIG = {
     "run_interval_minutes": 60,            # Частота запуска агента (каждый час)
     "run_at_hour_start": True,             # Запускать в начале каждого часа (10:00, 11:00, ...)
-    "max_expiration_days": 3,              # Максимальная экспирация для анализа (3 дня)
-    "ivr_threshold": 50,                   # Порог IVR для фильтрации
-    "min_confidence": 0.4,                 # Минимальная уверенность для сигнала
+    "max_expiration_days": 3,              # Максимальная экспирация для анализа 
+    "min_confidence": 0.5,                 # Минимальная уверенность для сигнала
     "deepseek_api_key": _deepseek_api_key,
     "deepseek_model": "deepseek-chat",
     "deepseek_base_url": "https://api.deepseek.com",
     "enable_signal_history": True,         # Сохранение истории сигналов
     # Обработка ошибок и retry
-    "api_retry_attempts": 3,               # Количество попыток повтора при ошибке API
+    "api_retry_attempts": 2,               # Количество попыток повтора при ошибке API
     "api_retry_delay_seconds": 2,          # Начальная задержка между попытками (секунды)
     "api_timeout_seconds": 30,            # Таймаут для API запросов (секунды)
     "skip_on_api_error": True,            # Пропускать цикл при недоступности API (не падать)

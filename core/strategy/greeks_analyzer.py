@@ -57,7 +57,7 @@ class GreeksAnalyzer:
             pass
         return None
     
-    def analyze_gamma_distribution(self, options_data: Dict[str, Dict]) -> Dict:
+    def analyze_gamma_distribution(self, options_data: Dict[str, Dict], threshold: Optional[float] = None) -> Dict:
         """
         Анализ распределения гаммы по страйкам
         
@@ -122,14 +122,15 @@ class GreeksAnalyzer:
             else:
                 concentration = 0
             
-            is_concentrated = concentration >= self.gamma_threshold
+            threshold_value = self.gamma_threshold if threshold is None else threshold
+            is_concentrated = concentration >= threshold_value
             
             result = {
                 'total_gamma': total_gamma,
                 'concentration': concentration,
                 'max_gamma_strike': max_gamma_strike,
                 'is_concentrated': is_concentrated,
-                'threshold': self.gamma_threshold
+                'threshold': threshold_value
             }
             
             logger.debug(
@@ -149,7 +150,7 @@ class GreeksAnalyzer:
                 'error': str(e)
             }
     
-    def analyze_vega_distribution(self, options_data: Dict[str, Dict]) -> Dict:
+    def analyze_vega_distribution(self, options_data: Dict[str, Dict], threshold: Optional[float] = None) -> Dict:
         """
         Анализ распределения веги по страйкам
         
@@ -201,14 +202,15 @@ class GreeksAnalyzer:
             else:
                 concentration = 0
             
-            is_concentrated = concentration >= self.vega_threshold
+            threshold_value = self.vega_threshold if threshold is None else threshold
+            is_concentrated = concentration >= threshold_value
             
             result = {
                 'total_vega': total_vega,
                 'concentration': concentration,
                 'max_vega_strike': max_vega_strike,
                 'is_concentrated': is_concentrated,
-                'threshold': self.vega_threshold
+                'threshold': threshold_value
             }
             
             logger.debug(
@@ -228,7 +230,12 @@ class GreeksAnalyzer:
                 'error': str(e)
             }
     
-    def calculate_skew(self, options_data: Dict[str, Dict], underlying_price: Optional[float] = None) -> Dict:
+    def calculate_skew(
+        self,
+        options_data: Dict[str, Dict],
+        underlying_price: Optional[float] = None,
+        threshold: Optional[float] = None
+    ) -> Dict:
         """
         Вычислить скью (асимметрию) распределения опционов
         
@@ -276,7 +283,8 @@ class GreeksAnalyzer:
             else:
                 skew = 0.0
             
-            is_skewed = abs(skew) >= self.skew_threshold
+            threshold_value = self.skew_threshold if threshold is None else threshold
+            is_skewed = abs(skew) >= threshold_value
             
             result = {
                 'skew': skew,
@@ -285,7 +293,7 @@ class GreeksAnalyzer:
                 'avg_call_delta': avg_call_delta,
                 'avg_put_delta': avg_put_delta,
                 'is_skewed': is_skewed,
-                'threshold': self.skew_threshold
+                'threshold': threshold_value
             }
             
             logger.debug(
@@ -305,7 +313,12 @@ class GreeksAnalyzer:
                 'error': str(e)
             }
     
-    def analyze_all(self, options_data: Dict[str, Dict], underlying_price: Optional[float] = None) -> Dict:
+    def analyze_all(
+        self,
+        options_data: Dict[str, Dict],
+        underlying_price: Optional[float] = None,
+        thresholds: Optional[Dict[str, float]] = None
+    ) -> Dict:
         """
         Комплексный анализ распределения греков
         
@@ -316,10 +329,13 @@ class GreeksAnalyzer:
         Returns:
             Словарь со всеми анализами
         """
+        gamma_threshold = thresholds.get("gamma_concentration_threshold") if thresholds else None
+        vega_threshold = thresholds.get("vega_concentration_threshold") if thresholds else None
+        skew_threshold = thresholds.get("skew_threshold") if thresholds else None
         return {
-            'gamma': self.analyze_gamma_distribution(options_data),
-            'vega': self.analyze_vega_distribution(options_data),
-            'skew': self.calculate_skew(options_data, underlying_price)
+            'gamma': self.analyze_gamma_distribution(options_data, threshold=gamma_threshold),
+            'vega': self.analyze_vega_distribution(options_data, threshold=vega_threshold),
+            'skew': self.calculate_skew(options_data, underlying_price, threshold=skew_threshold)
         }
 
 

@@ -80,6 +80,16 @@ class OptionDatabase:
        - entry_timestamp, exit_timestamp: DATETIME
        - status: TEXT - 'pending', 'entered', 'closed', 'expired'
        - notes: TEXT
+
+    7. strategy_thresholds - динамические пороги стратегии
+       Поля:
+       - underlying: TEXT - базовый актив
+       - dte_bucket: TEXT - бин days_to_expiration (например, '0-1', '2-3', '31-60')
+       - metric: TEXT - имя порога (например, 'skew_threshold')
+       - value: REAL - рассчитанное значение порога
+       - sample_size: INTEGER - размер выборки
+       - method: TEXT - метод расчета (например, 'pct_85')
+       - computed_at: DATETIME - время расчета
        
     Важные особенности:
     - В БД сохраняются ТОЛЬКО OTM (Out of The Money) опционы
@@ -393,6 +403,31 @@ class OptionDatabase:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_signal_results_status 
                 ON signal_results(status)
+            """)
+
+            # Таблица динамических порогов стратегии
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS strategy_thresholds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    underlying TEXT NOT NULL,
+                    dte_bucket TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    method TEXT NOT NULL,
+                    computed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(underlying, dte_bucket, metric)
+                )
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_strategy_thresholds_underlying 
+                ON strategy_thresholds(underlying)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_strategy_thresholds_bucket 
+                ON strategy_thresholds(dte_bucket)
             """)
             
             conn.commit()
@@ -1111,7 +1146,8 @@ class OptionDatabase:
                 'iv_history',
                 'support_resistance_levels',
                 'agent_signals',
-                'signal_results'
+                'signal_results',
+                'strategy_thresholds'
             ]
             
             total = 0
@@ -1160,10 +1196,137 @@ class OptionDatabase:
                 'support_resistance_levels': 0,
                 'agent_signals': 0,
                 'signal_results': 0,
+                'strategy_thresholds': 0,
                 'total': 0,
                 'db_size_mb': 0.0,
                 'last_update': None
             }
+
+    def save_strategy_threshold(
+        self,
+        underlying: str,
+        dte_bucket: str,
+        metric: str,
+        value: float,
+        sample_size: int,
+        method: str
+    ):
+        """
+        Сохранить динамический порог стратегии (upsert)
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO strategy_thresholds (
+                    underlying, dte_bucket, metric, value, sample_size, method
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (underlying, dte_bucket, metric, value, sample_size, method))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при сохранении порога стратегии: {e}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_strategy_thresholds(self, underlying: str, dte_bucket: str) -> Dict[str, float]:
+        """
+        Получить все пороги для underlying + dte_bucket
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT metric, value
+                FROM strategy_thresholds
+                WHERE underlying = ? AND dte_bucket = ?
+            """, (underlying, dte_bucket))
+            rows = cursor.fetchall()
+            return {row["metric"]: row["value"] for row in rows}
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении порогов стратегии: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def get_all_strategy_thresholds(self) -> List[Dict]:
+        """
+        Получить все динамические пороги
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT underlying, dte_bucket, metric, value, sample_size, method, computed_at
+                FROM strategy_thresholds
+                ORDER BY underlying, dte_bucket, metric
+            """)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении всех порогов стратегии: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def get_threshold_last_computed(self, underlying: str, dte_bucket: str) -> Optional[datetime]:
+        """
+        Получить время последнего расчета порогов
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT MAX(computed_at) AS last_computed
+                FROM strategy_thresholds
+                WHERE underlying = ? AND dte_bucket = ?
+            """, (underlying, dte_bucket))
+            row = cursor.fetchone()
+            if row and row["last_computed"]:
+                return self._parse_local_datetime(row["last_computed"])
+            return None
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении времени расчета порогов: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_option_history_for_thresholds(
+        self,
+        underlying: str,
+        min_dte: int,
+        max_dte: Optional[int],
+        since: datetime
+    ) -> List[Dict]:
+        """
+        Получить историю опционов для расчета динамических порогов
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            since_local = self._format_local_datetime(since)
+            query = """
+                SELECT symbol, date_data_collection, delta, gamma, vega, volume_24h, iv
+                FROM option_history
+                WHERE underlying_ticker = ?
+                  AND days_to_expiration >= ?
+                  AND date_data_collection >= ?
+            """
+            params: List = [underlying, min_dte, since_local]
+            if max_dte is not None:
+                query += " AND days_to_expiration <= ?"
+                params.append(max_dte)
+            query += " ORDER BY date_data_collection ASC"
+            self._log_sql_query(query, tuple(params))
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении истории опционов для порогов: {e}")
+            raise
+        finally:
+            conn.close()
 
 
 # Глобальный экземпляр базы данных
