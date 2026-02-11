@@ -36,10 +36,12 @@ SUBSCRIPTION_CONFIG = {
     "max_expiration_days": 365,              # Максимум дней до экспирации для подписки
     "strike_step_3days": 500,              # Шаг страйка для опционов до 3 дней
     "strike_steps_count": 7,               # ±7 шагов от текущей цены
-    "daily_update_time_utc": "15:05",      # Время обновления подписок 
+    "daily_update_time_utc": "15:05",      # Время обновления подписок
     "skip_today_expiration": False,        # Собираем данные до экспирации (days_to_expiration = 0)
     "new_options_time_utc": "15:05",       # Время добавления новых опционов на бирже
     "save_only_otm": True,                 # Сохранять только OTM опционы
+    "refresh_job_timeout_sec": 120,         # Таймаут задачи переподписки (сек); после него задача считается завершённой
+    "http_request_timeout_sec": 30,       # Таймаут HTTP-запросов к бирже (доска опционов)
 }
 
 # Конфигурация анализа исторических данных

@@ -1,6 +1,7 @@
 from pybit.unified_trading import WebSocket
 import sys
 from pathlib import Path
+import threading
 
 # Добавляем корень проекта в путь для импортов
 project_root = Path(__file__).parent.parent
@@ -10,22 +11,34 @@ from config import CONFIG, DATA_CONFIG, DISPLAY_TIMEZONE
 from services.data_store import data_store
 import logging
 import json
-from typing import List
-from datetime import datetime, timedelta, timezone
+from typing import List, Set
+from datetime import datetime, timezone
 import time
-from typing import Set
 from utils.logging_config import setup_service_logging
 
 # Настройка логирования с ротацией файлов (INFO вместо DEBUG чтобы не перегружать логи)
 logger = setup_service_logging(service_name="websocket_manager", log_level=logging.WARNING)
 
+
 class OptionWebSocketManager:
-    """Менеджер WebSocket подключений"""
+    """Менеджер WebSocket подключений. Доступ к ws/active_symbols/is_connected защищён lock."""
 
     def __init__(self):
+        self._lock = threading.RLock()
         self.ws = None
-        self.active_symbols = set()
+        self.active_symbols: Set[str] = set()
         self.is_connected = False
+        self._periodic_save_started = False
+
+    def get_active_symbols_copy(self) -> List[str]:
+        """Потокобезопасно вернуть копию списка активных символов."""
+        with self._lock:
+            return list(self.active_symbols)
+
+    def _get_connection_status(self) -> tuple:
+        """Потокобезопасно вернуть (ws_ref, is_connected)."""
+        with self._lock:
+            return (self.ws, self.is_connected)
 
     def create_option_symbol(
             self,
@@ -163,66 +176,59 @@ class OptionWebSocketManager:
 
     def connect(self, symbols: List[str], wait_for_data: bool = True):
         """Подключиться к WebSocket с указанными символами"""
-        if self.ws and self.is_connected:
-            # Если уже подключены, добавляем новые символы
+        with self._lock:
+            if self.ws and self.is_connected:
+                need_add = True
+            else:
+                need_add = False
+        if need_add:
             self.add_symbols(symbols)
         else:
             try:
-                self.ws = WebSocket(
+                ws_new = WebSocket(
                     testnet=CONFIG["testnet"],
                     channel_type='option',
                     retries=CONFIG["retries"],
                     restart_on_error=CONFIG["restart_on_error"],
                 )
-
-                # Отключаем DEBUG логирование pybit (слишком много логов)
                 import logging as pybit_logging
                 pybit_logging.getLogger("pybit").setLevel(logging.WARNING)
-
-                logger.info(f"Subscribing to symbols: {symbols}")
-
-                self.ws.ticker_stream(
-                    symbol=symbols,
-                    callback=self.handle_message
-                )
-
-                self.active_symbols.update(symbols)
-                self.is_connected = True
-                logger.info(f"✅ WebSocket connected for {len(symbols)} symbols")
-                
-                # Запускаем периодическое сохранение данных в БД
-                if DATA_CONFIG.get("save_interval_minutes"):
+                logger.info("Подписка на символы: %s", symbols)
+                ws_new.ticker_stream(symbol=symbols, callback=self.handle_message)
+                with self._lock:
+                    self.ws = ws_new
+                    self.active_symbols = set(symbols)
+                    self.is_connected = True
+                logger.info("WebSocket подключён, символов: %s", len(symbols))
+                if DATA_CONFIG.get("save_interval_minutes") and not self._periodic_save_started:
                     try:
                         data_store.start_periodic_save(
                             interval_minutes=DATA_CONFIG["save_interval_minutes"],
-                            align_to_interval=DATA_CONFIG.get("align_to_interval", True)
+                            align_to_interval=DATA_CONFIG.get("align_to_interval", True),
                         )
+                        self._periodic_save_started = True
                         logger.info("Периодическое сохранение данных в БД запущено")
                     except Exception as e:
-                        logger.error(f"Ошибка при запуске периодического сохранения: {e}", exc_info=True)
-
+                        logger.error("Ошибка при запуске периодического сохранения: %s", e, exc_info=True)
             except Exception as e:
-                logger.error(f"❌ Failed to connect WebSocket: {e}")
+                logger.error("Ошибка подключения WebSocket: %s", e)
                 raise
-
-        # Ждем получения данных если нужно
         if wait_for_data:
             return self.wait_for_data(symbols)
         return True
 
     def add_symbols(self, symbols: List[str]):
         """Добавить новые символы для отслеживания"""
-        if not self.is_connected:
-            return
-
-        new_symbols = [s for s in symbols if s not in self.active_symbols]
+        with self._lock:
+            if not self.is_connected or self.ws is None:
+                return
+            ws_ref = self.ws
+            new_symbols = [s for s in symbols if s not in self.active_symbols]
         if new_symbols:
-            self.ws.ticker_stream(
-                symbol=new_symbols,
-                callback=self.handle_message
-            )
-            self.active_symbols.update(new_symbols)
-            logger.info(f"Added symbols: {new_symbols}")
+            ws_ref.ticker_stream(symbol=new_symbols, callback=self.handle_message)
+            with self._lock:
+                self.active_symbols.update(new_symbols)
+            logger.info("Добавлены символы: %s", new_symbols)
 
     def remove_symbols(self, symbols: List[str]):
         """Убрать символы из отслеживания"""
@@ -231,44 +237,40 @@ class OptionWebSocketManager:
         pass
 
     def disconnect(self):
-        """Отключить WebSocket"""
-        if self.ws:
+        """Отключить WebSocket (потокобезопасно)"""
+        with self._lock:
+            ws_ref = self.ws
+            self.ws = None
+            self.is_connected = False
+        if ws_ref:
             try:
-                if hasattr(self.ws, "close"):
-                    self.ws.close()
-                elif hasattr(self.ws, "stop"):
-                    self.ws.stop()
-                elif hasattr(self.ws, "exit"):
-                    self.ws.exit()
+                if hasattr(ws_ref, "close"):
+                    ws_ref.close()
+                elif hasattr(ws_ref, "stop"):
+                    ws_ref.stop()
+                elif hasattr(ws_ref, "exit"):
+                    ws_ref.exit()
                 else:
                     logger.warning("WebSocket object has no close/stop/exit method")
             except Exception as e:
-                logger.error(f"Ошибка при отключении WebSocket: {e}", exc_info=True)
-            finally:
-                self.is_connected = False
-                self.ws = None
-            logger.info("WebSocket disconnected")
+                logger.error("Ошибка при отключении WebSocket: %s", e, exc_info=True)
+            logger.info("WebSocket отключён")
 
     def update_subscriptions(self, symbols: List[str]):
-        """Обновить список отслеживаемых символов"""
-        if not self.is_connected:
-            self.connect(symbols)
-            return
-
-        # Сравниваем текущие и новые символы
+        """Обновить список отслеживаемых символов (потокобезопасно)"""
+        with self._lock:
+            connected = self.is_connected
+            current = set(self.active_symbols)
         symbols_set = set(symbols)
-
-        # Если списки одинаковые, ничего не делаем
-        if symbols_set == self.active_symbols:
+        if not connected:
+            self.connect(list(symbols_set))
             return
-
-        # Закрываем текущее соединение
+        if symbols_set == current:
+            return
         self.disconnect()
-
-        # Переподключаемся с новым списком символов
-        time.sleep(1)  # Небольшая пауза
+        time.sleep(1)
         self.connect(list(symbols_set))
-        logger.info(f"WebSocket subscriptions updated. Now tracking: {len(symbols_set)} symbols")
+        logger.info("Подписки WebSocket обновлены, отслеживается символов: %s", len(symbols_set))
 
     def wait_for_data(self, symbols: List[str], timeout: int = 30) -> bool:
         """Ожидать получения данных по символам"""

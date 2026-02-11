@@ -3,8 +3,9 @@
 Получение списка опционов для подписки через WebSocket
 """
 import logging
+import concurrent.futures
 from datetime import datetime, timedelta, date
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Set, Tuple, Callable, TypeVar
 import re
 
 from pybit.unified_trading import HTTP
@@ -12,6 +13,18 @@ from pybit.unified_trading import HTTP
 from config import CONFIG, SUBSCRIPTION_CONFIG
 
 logger = logging.getLogger(__name__)
+
+# Таймаут HTTP-запросов к бирже (сек), чтобы не блокировать поток переподписки
+HTTP_REQUEST_TIMEOUT_SEC = SUBSCRIPTION_CONFIG.get("http_request_timeout_sec", 30)
+
+T = TypeVar("T")
+
+
+def _run_with_timeout(timeout_sec: int, func: Callable[..., T], *args, **kwargs) -> T:
+    """Выполнить функцию в потоке с таймаутом. При таймауте — TimeoutError."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(func, *args, **kwargs)
+        return future.result(timeout=timeout_sec)
 
 
 def delivery_time_to_date(delivery_time_ms: int) -> date:
@@ -175,26 +188,57 @@ class OptionBoard:
                 - 'underlying_price': текущая цена базового актива
         """
         try:
-            # Получаем текущую цену базового актива
-            underlying_price = self._get_underlying_price(underlying)
-            if underlying_price is None:
-                logger.error(f"❌ Не удалось получить цену базового актива {underlying}")
+            # Получаем текущую цену базового актива (с таймаутом, чтобы не блокировать надолго)
+            try:
+                underlying_price = _run_with_timeout(
+                    HTTP_REQUEST_TIMEOUT_SEC,
+                    self._get_underlying_price,
+                    underlying,
+                )
+            except concurrent.futures.TimeoutError:
+                logger.error(
+                    "Таймаут (%s с) при получении цены базового актива %s",
+                    HTTP_REQUEST_TIMEOUT_SEC,
+                    underlying,
+                )
                 return {
-                    'symbols': [],
-                    'expirations': [],
-                    'strikes': [],
-                    'underlying_price': None
+                    "symbols": [],
+                    "expirations": [],
+                    "strikes": [],
+                    "underlying_price": None,
                 }
-            
-            # Получаем список опционов с фильтрацией по базовому активу
-            logger.info(f"📡 Запрос списка опционов для {underlying} через Bybit API...")
-            response = self.http_client.get_instruments_info(
-                category="option",
-                status="Trading",
-                baseCoin=underlying,
-                settleCoin="USDT",
-                limit=1000
-            )
+            if underlying_price is None:
+                logger.error("Не удалось получить цену базового актива %s", underlying)
+                return {
+                    "symbols": [],
+                    "expirations": [],
+                    "strikes": [],
+                    "underlying_price": None,
+                }
+
+            logger.info("Запрос списка опционов для %s через Bybit API (таймаут %s с)...", underlying, HTTP_REQUEST_TIMEOUT_SEC)
+            try:
+                response = _run_with_timeout(
+                    HTTP_REQUEST_TIMEOUT_SEC,
+                    self.http_client.get_instruments_info,
+                    category="option",
+                    status="Trading",
+                    baseCoin=underlying,
+                    settleCoin="USDT",
+                    limit=1000,
+                )
+            except concurrent.futures.TimeoutError:
+                logger.error(
+                    "Таймаут (%s с) при получении списка опционов для %s",
+                    HTTP_REQUEST_TIMEOUT_SEC,
+                    underlying,
+                )
+                return {
+                    "symbols": [],
+                    "expirations": [],
+                    "strikes": [],
+                    "underlying_price": underlying_price,
+                }
             
             logger.debug(f"Ответ API: retCode={response.get('retCode')}, retMsg={response.get('retMsg')}")
             

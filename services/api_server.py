@@ -38,16 +38,26 @@ from services.data_store import data_store
 from core.data.database import get_database
 from core.data.option_board import get_option_board, is_otm
 from core.strategy.dynamic_thresholds import DynamicThresholds
-from utils.logging_config import setup_service_logging
+from utils.logging_config import setup_logging as _setup_logging_base
 from utils.log_buffer import get_log_buffer_handler
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import threading
 
-# Настройка логирования с ротацией файлов
+# Настройка логирования: читаемый формат с временем и описанием на русском
 print("Setting up logging...", flush=True)
-logger = setup_service_logging(service_name="api_server", log_level=logging.INFO)
+_log_format = "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"
+_log_datefmt = "%Y-%m-%d %H:%M:%S"
+logger = _setup_logging_base(
+    service_name="api_server",
+    log_level=logging.INFO,
+    format_string=_log_format,
+)
+# Устанавливаем формат даты/времени для всех хендлеров api_server
+for h in logger.handlers:
+    if hasattr(h, "setFormatter") and isinstance(h.formatter, logging.Formatter):
+        h.setFormatter(logging.Formatter(_log_format, datefmt=_log_datefmt))
 print("✓ Logger initialized", flush=True)
 
 # Инициализация log buffer handler для админ-панели
@@ -76,7 +86,7 @@ app.add_middleware(
 # Проверяем путь к static директории (в Docker это /app/static, локально - project_root/static)
 static_dir = Path("/app/static") if Path("/app/static").exists() else project_root / "static"
 static_dir.mkdir(exist_ok=True, parents=True)
-logger.info(f"Static directory: {static_dir.absolute()}")
+logger.info("Каталог статики: %s", static_dir.absolute())
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Настройки подписок и времени (UTC+7)
@@ -109,13 +119,15 @@ def refresh_option_subscriptions() -> Dict[str, int]:
     Переподписка на опционы (обновление списка активных символов).
     Использует доску опционов и переподключает WebSocket.
     """
+    logger.info("Переподписка на опционы: начало выполнения задачи")
     if not subscription_lock.acquire(blocking=False):
-        logger.warning("⚠️ Переподписка уже выполняется, пропускаем новый запуск")
-        return {"old_count": len(ws_manager.active_symbols), "new_count": len(ws_manager.active_symbols)}
+        logger.warning("Переподписка уже выполняется в другом потоке; новый запуск пропущен")
+        active = ws_manager.get_active_symbols_copy()
+        return {"old_count": len(active), "new_count": len(active)}
     try:
         global last_subscription_refresh
         last_subscription_refresh = datetime.now(DISPLAY_TIMEZONE)
-        logger.info("🔄 Запуск переподписки на опционы (UTC+7)")
+        logger.info("Переподписка: получение списка символов с биржи (UTC+7)")
         all_symbols: List[str] = []
         max_days = SUBSCRIPTION_CONFIG.get("max_expiration_days", 3)
 
@@ -124,22 +136,19 @@ def refresh_option_subscriptions() -> Dict[str, int]:
             symbols = board_data.get("symbols", [])
             if symbols:
                 all_symbols.extend(symbols)
-                logger.info(f"✅ {underlying}: найдено {len(symbols)} символов")
+                logger.info("Переподписка: по активу %s найдено символов — %s", underlying, len(symbols))
             else:
-                logger.warning(f"⚠️ {underlying}: символы не найдены")
+                logger.warning("Переподписка: по активу %s символы не найдены", underlying)
 
         if not all_symbols:
-            logger.warning("⚠️ Переподписка пропущена: список символов пуст")
-            return {"old_count": len(ws_manager.active_symbols), "new_count": 0}
+            logger.warning("Переподписка: список символов пуст, обновление отменено")
+            return {"old_count": len(ws_manager.get_active_symbols_copy()), "new_count": 0}
 
-        # Убираем дубликаты
         unique_symbols = list(set(all_symbols))
 
-        # Обновляем подписки WebSocket
-        old_count = len(ws_manager.active_symbols)
+        old_count = len(ws_manager.get_active_symbols_copy())
         ws_manager.update_subscriptions(unique_symbols)
-        new_count = len(ws_manager.active_symbols)
-        # Обновляем время следующей переподписки
+        new_count = len(ws_manager.get_active_symbols_copy())
         try:
             job = subscription_scheduler.get_job("daily_subscription_update")
             if job:
@@ -148,21 +157,37 @@ def refresh_option_subscriptions() -> Dict[str, int]:
         except Exception:
             pass
 
-        logger.info(f"✅ Подписки обновлены: было {old_count}, стало {new_count}")
+        logger.info("Переподписка завершена успешно: было подписок %s, стало %s", old_count, new_count)
         return {"old_count": old_count, "new_count": new_count}
     except Exception as e:
-        logger.error(f"Ошибка при переподписке на опционы: {e}", exc_info=True)
-        return {"old_count": len(ws_manager.active_symbols), "new_count": len(ws_manager.active_symbols)}
+        logger.error("Переподписка завершена с ошибкой: %s", e, exc_info=True)
+        active = ws_manager.get_active_symbols_copy()
+        return {"old_count": len(active), "new_count": len(active)}
     finally:
         subscription_lock.release()
+        logger.info("Переподписка на опционы: задача завершена (освобождён lock)")
+
+
+REFRESH_JOB_TIMEOUT_SEC = SUBSCRIPTION_CONFIG.get("refresh_job_timeout_sec", 120)
 
 
 async def refresh_option_subscriptions_async() -> Dict[str, int]:
     """
-    Асинхронный безопасный запуск переподписки.
-    Выполняем в отдельном потоке, чтобы не блокировать event loop.
+    Асинхронный запуск переподписки в отдельном потоке с таймаутом.
+    После таймаута задача считается завершённой, чтобы следующий запуск по расписанию не пропускался.
     """
-    return await asyncio.to_thread(refresh_option_subscriptions)
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(refresh_option_subscriptions),
+            timeout=REFRESH_JOB_TIMEOUT_SEC,
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.error(
+            "Переподписка не завершилась за %s с (таймаут). Следующая попытка — по расписанию.",
+            REFRESH_JOB_TIMEOUT_SEC,
+        )
+        return {"old_count": 0, "new_count": 0, "timeout": True}
 
 
 @app.on_event("startup")
@@ -180,14 +205,17 @@ async def startup_event():
             replace_existing=True,
             misfire_grace_time=3600,
             coalesce=True,
+            max_instances=1,
         )
         subscription_scheduler.start()
         logger.info(
-            f"🕒 Планировщик переподписки запущен (ежедневно в {SUBSCRIPTION_UPDATE_HOUR:02d}:{SUBSCRIPTION_UPDATE_MINUTE:02d} UTC+7)"
+            "Планировщик переподписки запущен: ежедневно в %s UTC+7, таймаут задачи %s с",
+            f"{SUBSCRIPTION_UPDATE_HOUR:02d}:{SUBSCRIPTION_UPDATE_MINUTE:02d}",
+            REFRESH_JOB_TIMEOUT_SEC,
         )
         global next_subscription_run
         next_subscription_run = job.next_run_time
-        logger.info(f"⏭️ Следующая переподписка: {next_subscription_run}")
+        logger.info("Следующая переподписка по расписанию: %s", next_subscription_run)
     # Первичная подписка при старте, чтобы админ-панель сразу показывала актуальные данные
     await refresh_option_subscriptions_async()
 
@@ -237,7 +265,7 @@ async def get_option_data(symbol: str):
     data = data_store.get(symbol)
     if not data:
         # Проверяем, подписан ли символ
-        if symbol in ws_manager.active_symbols:
+        if symbol in ws_manager.get_active_symbols_copy():
             return {
                 "symbol": symbol,
                 "status": "subscribed",
@@ -274,7 +302,7 @@ async def subscribe_to_options(symbols: List[OptionSymbol]):
     return {
         "status": "subscribed",
         "symbols": symbol_strings,
-        "active_symbols": list(ws_manager.active_symbols)
+        "active_symbols": ws_manager.get_active_symbols_copy()
     }
 
 
@@ -282,8 +310,8 @@ async def subscribe_to_options(symbols: List[OptionSymbol]):
 async def get_active_symbols():
     """Получить список активных символов"""
     return {
-        "active_symbols": list(ws_manager.active_symbols),
-        "total": len(ws_manager.active_symbols)
+        "active_symbols": ws_manager.get_active_symbols_copy(),
+        "total": len(ws_manager.get_active_symbols_copy())
     }
 
 
@@ -292,7 +320,7 @@ async def update_subscriptions(symbols: List[str]):
     """Обновить подписки WebSocket"""
     try:
         # Получаем текущие активные символы
-        current_symbols = list(ws_manager.active_symbols)
+        current_symbols = ws_manager.get_active_symbols_copy()
 
         # Формируем новый список (объединение старых и новых)
         all_symbols = list(set(current_symbols + symbols))
@@ -304,10 +332,10 @@ async def update_subscriptions(symbols: List[str]):
             "status": "updated",
             "old_symbols_count": len(current_symbols),
             "new_symbols_count": len(all_symbols),
-            "active_symbols": list(ws_manager.active_symbols)
+            "active_symbols": ws_manager.get_active_symbols_copy()
         }
     except Exception as e:
-        logger.error(f"Error updating subscriptions: {e}")
+        logger.error("Ошибка обновления подписок: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -315,8 +343,8 @@ async def update_subscriptions(symbols: List[str]):
 async def get_active_subscriptions():
     """Получить активные подписки"""
     return {
-        "active_symbols": list(ws_manager.active_symbols),
-        "count": len(ws_manager.active_symbols)
+        "active_symbols": ws_manager.get_active_symbols_copy(),
+        "count": len(ws_manager.get_active_symbols_copy())
     }
 
 
@@ -349,8 +377,8 @@ async def check_option_data(symbol: str):
         return {
             "symbol": symbol,
             "available": False,
-            "subscribed": symbol in ws_manager.active_symbols,
-            "message": "No data available" if symbol in ws_manager.active_symbols else "Not subscribed"
+            "subscribed": symbol in ws_manager.get_active_symbols_copy(),
+            "message": "Нет данных" if symbol in ws_manager.get_active_symbols_copy() else "Нет подписки"
         }
 
 
@@ -360,14 +388,14 @@ async def check_option_data(symbol: str):
 async def admin_panel():
     """Главная страница админ-панели"""
     admin_html_path = static_dir / "admin.html"
-    logger.info(f"Trying to load admin.html from: {admin_html_path.absolute()}")
-    logger.info(f"File exists: {admin_html_path.exists()}")
+    logger.info("Загрузка админ-панели: %s", admin_html_path.absolute())
+    logger.info("Файл админ-панели существует: %s", admin_html_path.exists())
     
     if admin_html_path.exists():
         return FileResponse(admin_html_path)
     else:
         # Если файл не найден, возвращаем простое сообщение
-        logger.warning(f"Admin HTML file not found at {admin_html_path.absolute()}")
+        logger.warning("Файл админ-панели не найден: %s", admin_html_path.absolute())
         return HTMLResponse(f"""
         <html>
             <head><title>Admin Panel - File Not Found</title></head>
@@ -419,7 +447,7 @@ async def get_dynamic_thresholds():
             "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
         }
     except Exception as e:
-        logger.error(f"Error getting dynamic thresholds: {e}", exc_info=True)
+        logger.error("Ошибка получения динамических порогов: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -461,7 +489,7 @@ async def recalculate_thresholds(underlying: Optional[str] = None, dte_bucket: O
             "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
         }
     except Exception as e:
-        logger.error(f"Error recalculating thresholds: {e}", exc_info=True)
+        logger.error("Ошибка пересчёта порогов: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -492,7 +520,7 @@ async def get_active_thresholds(underlying: str):
             "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
         }
     except Exception as e:
-        logger.error(f"Error getting active thresholds: {e}", exc_info=True)
+        logger.error("Ошибка получения активных порогов: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -518,20 +546,16 @@ async def get_application_status():
             "last_update": format_datetime_local(last_update) if last_update else None
         }
         
-        # Статус WebSocket менеджера - проверяем не только is_connected, но и наличие ws и активных символов
-        # WebSocket считается подключенным, если:
-        # 1. is_connected = True, ИЛИ
-        # 2. есть ws объект и активные символы, ИЛИ
-        # 3. есть данные в data_store (значит WebSocket работает, даже если статус не обновлен)
-        has_ws_object = ws_manager.ws is not None
-        has_active_symbols = len(ws_manager.active_symbols) > 0
-        has_data_in_store = len(all_data) > 0  # Если есть данные, значит WebSocket работал
-        
-        ws_connected = ws_manager.is_connected or (has_ws_object and has_active_symbols) or has_data_in_store
-        
-        # Подсчет подписанных OTM опционов (которые сохраняются в БД)
+        # Статус WebSocket: is_connected, наличие ws и активных символов или данные в store
+        ws_ref, is_conn = ws_manager._get_connection_status()
+        active_symbols_list = ws_manager.get_active_symbols_copy()
+        has_ws_object = ws_ref is not None
+        has_active_symbols = len(active_symbols_list) > 0
+        has_data_in_store = len(all_data) > 0
+        ws_connected = is_conn or (has_ws_object and has_active_symbols) or has_data_in_store
+
         otm_subscribed_count = 0
-        for symbol in ws_manager.active_symbols:
+        for symbol in active_symbols_list:
             data = all_data.get(symbol)
             if not data:
                 continue
@@ -551,11 +575,11 @@ async def get_application_status():
 
         ws_status = {
             "connected": ws_connected,
-            "active_symbols_count": len(ws_manager.active_symbols),
+            "active_symbols_count": len(active_symbols_list),
             "otm_subscribed_count": otm_subscribed_count,
             "last_resubscribe": format_datetime_local(last_subscription_refresh) if last_subscription_refresh else None,
             "next_resubscribe": format_datetime_local(next_subscription_run) if next_subscription_run else None,
-            "active_symbols": list(ws_manager.active_symbols)[:50]  # Первые 50 для просмотра
+            "active_symbols": active_symbols_list[:50]
         }
         
         # Общий статус
@@ -570,7 +594,7 @@ async def get_application_status():
             }
         }
     except Exception as e:
-        logger.error(f"Error getting application status: {e}", exc_info=True)
+        logger.error("Ошибка получения статуса приложения: %s", e, exc_info=True)
         return {
             "status": "error",
             "error": str(e),
@@ -598,7 +622,7 @@ async def get_database_stats():
         }
         return result
     except Exception as e:
-        logger.error(f"Error getting database stats: {e}", exc_info=True)
+        logger.error("Ошибка получения статистики БД: %s", e, exc_info=True)
         # Возвращаем пустую статистику вместо ошибки, чтобы админ-панель не падала
         return {
             'option_history': 0,
@@ -683,7 +707,7 @@ async def get_logs(limit: int = 100, level: Optional[str] = None, logger_name: O
             "counts_by_level": counts
         }
     except Exception as e:
-        logger.error(f"Error getting logs: {e}", exc_info=True)
+        logger.error("Ошибка получения логов: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -691,7 +715,7 @@ async def get_logs(limit: int = 100, level: Optional[str] = None, logger_name: O
 async def websocket_logs(websocket: WebSocket):
     """WebSocket для потоковой передачи логов в реальном времени"""
     await websocket.accept()
-    logger.info("WebSocket connection for logs established")
+    logger.info("WebSocket для логов: подключение установлено")
     
     try:
         # Отправляем последние 100 логов при подключении (исключая websocket_manager)
@@ -742,9 +766,9 @@ async def websocket_logs(websocket: WebSocket):
                 }, default=str))
             
     except WebSocketDisconnect:
-        logger.info("WebSocket connection for logs disconnected")
+        logger.info("WebSocket для логов: подключение закрыто")
     except Exception as e:
-        logger.error(f"Error in WebSocket logs: {e}", exc_info=True)
+        logger.error("Ошибка в WebSocket логов: %s", e, exc_info=True)
         try:
             await websocket.close()
         except:
@@ -757,9 +781,9 @@ if __name__ == "__main__":
     print(f"✓ Starting API server on port {server_port}...", flush=True)
     print(f"✓ Static directory: {static_dir.absolute()}", flush=True)
     print(f"✓ Admin HTML exists: {(static_dir / 'admin.html').exists()}", flush=True)
-    logger.info(f"Starting API server on port {server_port}...")
-    logger.info(f"Static directory: {static_dir.absolute()}")
-    logger.info(f"Admin HTML exists: {(static_dir / 'admin.html').exists()}")
+    logger.info("Запуск API-сервера на порту %s", server_port)
+    logger.info("Каталог статики: %s", static_dir.absolute())
+    logger.info("Файл админ-панели присутствует: %s", (static_dir / "admin.html").exists())
     try:
         print(f"✓ Starting uvicorn on port {server_port}...", flush=True)
         print(f"✓ Host: 0.0.0.0, Port: {server_port}", flush=True)
@@ -778,5 +802,5 @@ if __name__ == "__main__":
         print(f"✗ Error starting server: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        logger.error(f"Error starting server: {e}", exc_info=True)
+        logger.error("Ошибка запуска сервера: %s", e, exc_info=True)
         raise
