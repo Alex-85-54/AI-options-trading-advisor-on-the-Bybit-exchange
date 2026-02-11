@@ -444,12 +444,20 @@ async def recalculate_thresholds(underlying: Optional[str] = None, dte_bucket: O
             targets = sorted(list(underlyings))
         if not targets:
             return {"status": "skipped", "message": "Нет активных underlying для пересчета"}
+        insufficient = []
         for item in targets:
-            dynamic_thresholds.recalculate_for_underlying(item, dte_bucket=dte_bucket)
+            result = await asyncio.to_thread(
+                dynamic_thresholds.recalculate_for_underlying,
+                item,
+                dte_bucket,
+            )
+            if result.get("insufficient_bins"):
+                insufficient.append(result)
         return {
             "status": "ok",
             "underlyings": targets,
             "dte_bucket": dte_bucket,
+            "insufficient_bins": insufficient,
             "timestamp": format_datetime_local(datetime.now(DISPLAY_TIMEZONE)),
         }
     except Exception as e:

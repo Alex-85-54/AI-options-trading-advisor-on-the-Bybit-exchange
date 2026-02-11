@@ -1482,14 +1482,18 @@ class TelegramOptionBot:
         for underlying in UNDERLYING_ASSETS:
             try:
                 logger.info(f"🤖 Запуск анализа агента для {underlying} (пользователь {user_id})")
-                decision = self.agent_decision_engine.make_decision(underlying)
+                decisions = self.agent_decision_engine.make_decisions(underlying)
                 
                 self.agent_last_run[user_id] = datetime.now()
                 
-                if decision:
-                    self.agent_last_signal[user_id] = decision
-                    await self._send_agent_signal(chat_id, decision, context)
-                else:
+                found = False
+                for item in decisions:
+                    decision = item.get("decision")
+                    if decision:
+                        found = True
+                        self.agent_last_signal[user_id] = decision
+                        await self._send_agent_signal(chat_id, decision, context)
+                if not found:
                     logger.info(f"Агент не нашел подходящих условий для {underlying}")
                     
             except Exception as e:
@@ -1537,6 +1541,8 @@ class TelegramOptionBot:
         confidence = signal.get('confidence', 0)
         risk_level = signal.get('risk_level', 'medium')
         reasoning = signal.get('reasoning', '')
+        threshold_type = signal.get('threshold_type')
+        dte_bucket = signal.get('dte_bucket')
         
         # Экранируем пользовательские данные
         signal_type_escaped = escape_html(str(signal_type))
@@ -1589,6 +1595,12 @@ class TelegramOptionBot:
         if expiration:
             expiration_escaped = escape_html(str(expiration))
             message += f"<b>Экспирация:</b> {expiration_escaped}\n"
+        if threshold_type:
+            threshold_type_escaped = escape_html(str(threshold_type))
+            message += f"<b>Пороги:</b> {threshold_type_escaped}"
+            if dte_bucket:
+                message += f" (DTE бин: {escape_html(str(dte_bucket))})"
+            message += "\n"
         
         message += f"\n<b>Уверенность:</b> {conf_emoji} {confidence:.0%}\n"
         message += f"<b>Уровень риска:</b> {risk_emoji} {risk_level_escaped}\n"
@@ -1617,6 +1629,29 @@ class TelegramOptionBot:
         message += f"\n⚠️ <b>Внимание:</b> Это сигнал от ИИ агента. Всегда проверяйте анализ самостоятельно!"
         
         return message
+
+    async def _send_agent_no_signal(
+        self,
+        chat_id: int,
+        underlying: str,
+        expiration: Optional[str],
+        threshold_type: Optional[str],
+        context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Отправить сообщение о завершении анализа без сигнала для экспирации."""
+        expiration_text = f", экспирация {expiration}" if expiration else ""
+        threshold_text = f"Пороги: {threshold_type}" if threshold_type else "Пороги: статические"
+        message = (
+            f"ℹ️ <b>Анализ завершен</b>\n\n"
+            f"Базовый актив: {escape_html(underlying)}{escape_html(expiration_text)}\n"
+            f"{escape_html(threshold_text)}\n"
+            f"Подходящих условий для входа не найдено."
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message,
+            parse_mode='HTML'
+        )
     
     async def _handle_agent_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик callback для кнопок агента"""
@@ -1699,21 +1734,38 @@ class TelegramOptionBot:
                         return
                     
                     signals_found = []
+                    no_signals = []
                     errors = []
                     
                     for underlying in UNDERLYING_ASSETS:
                         try:
                             logger.info(f"🤖 Немедленный запуск анализа агента для {underlying} (пользователь {user_id})")
-                            decision = self.agent_decision_engine.make_decision(underlying)
+                            decisions = self.agent_decision_engine.make_decisions(underlying)
                             self.agent_last_run[user_id] = datetime.now()
                             
-                            if decision:
-                                self.agent_last_signal[user_id] = decision
-                                signals_found.append((underlying, decision))
-                                await self._send_agent_signal(chat_id, decision, context)
-                                logger.info(f"✅ Сигнал найден для {underlying}")
-                            else:
+                            if not decisions:
                                 logger.info(f"ℹ️ Анализ завершен для {underlying}. Подходящих условий не найдено.")
+                                no_signals.append((underlying, None, None))
+                                continue
+                            
+                            for item in decisions:
+                                decision = item.get("decision")
+                                expiration = item.get("expiration")
+                                threshold_type = item.get("threshold_type")
+                                if decision:
+                                    self.agent_last_signal[user_id] = decision
+                                    signals_found.append((underlying, decision))
+                                    await self._send_agent_signal(chat_id, decision, context)
+                                    logger.info(f"✅ Сигнал найден для {underlying} {expiration}")
+                                else:
+                                    no_signals.append((underlying, expiration, threshold_type))
+                                    await self._send_agent_no_signal(
+                                        chat_id,
+                                        underlying,
+                                        expiration,
+                                        threshold_type,
+                                        context
+                                    )
                         except Exception as e:
                             error_msg = f"Ошибка для {underlying}: {str(e)}"
                             logger.error(f"Ошибка при анализе {underlying}: {e}", exc_info=True)

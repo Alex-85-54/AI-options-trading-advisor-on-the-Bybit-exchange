@@ -371,7 +371,8 @@ class TradingAgent:
                 underlying=context.get('underlying', 'BTC'),
                 underlying_price=context.get('underlying_price', 0),
                 options_summary=json.dumps(context.get('options_summary', {}), indent=2, ensure_ascii=False),
-                ivr_threshold=ivr_threshold
+                ivr_threshold=ivr_threshold,
+                expiration=context.get('expiration', 'UNKNOWN')
             )
             
             messages = [

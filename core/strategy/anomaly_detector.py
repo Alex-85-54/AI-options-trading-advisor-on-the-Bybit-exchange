@@ -108,7 +108,7 @@ class AnomalyDetector:
             if spikes:
                 logger.info(
                     f"Обнаружено {len(spikes)} всплесков объема: "
-                    f"средний={avg_volume:.2f}, порог={threshold:.2f}"
+                    f"средний={avg_volume:.2f}, порог={threshold_value:.2f}"
                 )
             
             return result

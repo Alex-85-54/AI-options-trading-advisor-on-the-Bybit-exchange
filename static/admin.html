@@ -303,6 +303,9 @@
                 <h2>🎯 Активные пороги</h2>
                 <div style="margin-bottom: 10px;">
                     <input id="activeUnderlying" type="text" placeholder="BTC" style="padding:8px; border-radius:6px; border:1px solid #e5e7eb; margin-right:8px; width:80px;">
+                    <select id="activeDteBucket" style="padding:8px; border-radius:6px; border:1px solid #e5e7eb; margin-right:8px;">
+                        <option value="">DTE бин (авто)</option>
+                    </select>
                     <button class="btn" onclick="refreshActiveThresholds()">Обновить</button>
                 </div>
                 <div id="activeThresholdsPanel">
@@ -358,6 +361,7 @@
             loadAllData();
             connectLogsWebSocket();
             startAutoRefresh();
+            loadDteBins();
         });
 
         // Автообновление данных каждые 5 секунд
@@ -556,6 +560,14 @@
                         '<div style="color: #f59e0b;">' + (data.message || 'Пересчет завершен') + '</div>';
                 }
                 loadThresholds();
+                if (data.insufficient_bins && data.insufficient_bins.length > 0) {
+                    const warn = data.insufficient_bins.map(item => {
+                        const bins = item.insufficient_bins.map(b => b.dte_bucket).join(', ');
+                        return item.underlying + ': ' + bins;
+                    }).join(' | ');
+                    document.getElementById('thresholdsPanel').innerHTML +=
+                        '<div class="refresh-info" style="margin-top:10px; color:#f59e0b;">Недостаточно данных по бинам: ' + warn + '</div>';
+                }
             } catch (error) {
                 document.getElementById('thresholdsPanel').innerHTML =
                     '<div style="color: #ef4444;">Ошибка пересчета: ' + error.message + '</div>';
@@ -565,7 +577,9 @@
         // Загрузка активных порогов
         async function loadActiveThresholds(underlying) {
             try {
-                const response = await fetch('/admin/api/thresholds/active?underlying=' + encodeURIComponent(underlying));
+                const dteBucket = (document.getElementById('activeDteBucket').value || '').trim();
+                const query = dteBucket ? ('&dte_bucket=' + encodeURIComponent(dteBucket)) : '';
+                const response = await fetch('/admin/api/thresholds/active?underlying=' + encodeURIComponent(underlying) + query);
                 const data = await response.json();
                 if (data.status !== 'ok') {
                     document.getElementById('activeThresholdsPanel').innerHTML =
@@ -604,6 +618,25 @@
             }
             document.getElementById('activeThresholdsPanel').innerHTML = '<div class="loading">Обновление...</div>';
             loadActiveThresholds(underlying);
+        }
+
+        // Загрузка списка DTE бинов для выпадающего списка
+        async function loadDteBins() {
+            try {
+                const response = await fetch('/admin/api/thresholds');
+                const data = await response.json();
+                const select = document.getElementById('activeDteBucket');
+                if (!select) return;
+                const bins = data.dte_bins || [];
+                bins.forEach(bin => {
+                    const option = document.createElement('option');
+                    option.value = bin.label;
+                    option.textContent = bin.label;
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                // no-op
+            }
         }
 
         // Загрузка динамических порогов

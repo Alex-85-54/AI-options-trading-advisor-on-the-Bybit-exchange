@@ -76,27 +76,29 @@ class AgentScheduler:
                     logger.info(f"📊 Анализ актива: {underlying}")
                     
                     # Запускаем принятие решения
-                    decision = self.decision_engine.make_decision(underlying)
-                    
-                    if decision:
-                        signals_generated += 1
-                        self.stats['signals_generated'] += 1
-                        self.stats['last_signal_time'] = datetime.now()
-                        
-                        signal_type = decision.get('signal_type', 'unknown')
-                        confidence = decision.get('confidence', 0)
-                        reasoning = decision.get('reasoning', '')[:100]  # Первые 100 символов
-                        
-                        logger.info(
-                            f"✅ Сигнал сгенерирован для {underlying}:\n"
-                            f"   Тип: {signal_type}\n"
-                            f"   Уверенность: {confidence:.0%}\n"
-                            f"   Обоснование: {reasoning}..."
-                        )
-                        
-                        # Логируем полный сигнал
-                        logger.debug(f"Полный сигнал: {decision}")
-                    else:
+                    decisions = self.decision_engine.make_decisions(underlying)
+                    found = False
+                    for item in decisions:
+                        decision = item.get("decision")
+                        expiration = item.get("expiration")
+                        if decision:
+                            found = True
+                            signals_generated += 1
+                            self.stats['signals_generated'] += 1
+                            self.stats['last_signal_time'] = datetime.now()
+                            
+                            signal_type = decision.get('signal_type', 'unknown')
+                            confidence = decision.get('confidence', 0)
+                            reasoning = decision.get('reasoning', '')[:100]
+                            
+                            logger.info(
+                                f"✅ Сигнал сгенерирован для {underlying} {expiration}:\n"
+                                f"   Тип: {signal_type}\n"
+                                f"   Уверенность: {confidence:.0%}\n"
+                                f"   Обоснование: {reasoning}..."
+                            )
+                            logger.debug(f"Полный сигнал: {decision}")
+                    if not found:
                         logger.info(f"ℹ️ Подходящих условий для {underlying} не найдено")
                     
                 except Exception as e:

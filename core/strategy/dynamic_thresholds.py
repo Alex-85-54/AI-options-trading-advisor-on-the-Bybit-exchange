@@ -203,11 +203,11 @@ class DynamicThresholds:
                 thresholds[key] = value
         return thresholds
 
-    def _recalculate_thresholds(self, underlying: str, dte_bucket: str) -> None:
+    def _recalculate_thresholds(self, underlying: str, dte_bucket: str) -> Dict[str, int]:
         bucket_range = self._get_bucket_range(dte_bucket)
         if not bucket_range:
             logger.warning(f"Неизвестный DTE-бин: {dte_bucket}")
-            return
+            return {"dte_bucket": dte_bucket, "missing_data": 0}
         min_dte, max_dte = bucket_range
         since = datetime.utcnow() - timedelta(days=self.lookback_days)
         rows = self.db.get_option_history_for_thresholds(
@@ -218,7 +218,7 @@ class DynamicThresholds:
         )
         if not rows:
             logger.warning(f"Нет данных для расчета порогов: {underlying}/{dte_bucket}")
-            return
+            return {"dte_bucket": dte_bucket, "missing_data": 0}
         slices: Dict[str, List[Dict]] = defaultdict(list)
         volume_values: List[float] = []
         iv_values: List[float] = []
@@ -261,6 +261,7 @@ class DynamicThresholds:
             if iv_range > 0:
                 ivr_values = [max(0.0, min(100.0, ((iv - min_iv) / iv_range) * 100.0)) for iv in iv_values]
         calculations["ivr_threshold"] = (ivr_values, percentile_map.get("ivr_threshold", 85))
+        insufficient = {}
         for metric, (values, pct) in calculations.items():
             if pct is None:
                 continue
@@ -269,6 +270,7 @@ class DynamicThresholds:
                     f"Недостаточно данных для {metric} ({len(values)} < {self.min_sample_size}); "
                     f"используем fallback"
                 )
+                insufficient[metric] = len(values)
                 continue
             value = _percentile(values, pct)
             if value is None:
@@ -286,17 +288,27 @@ class DynamicThresholds:
                 f"Динамический порог {metric} для {underlying}/{dte_bucket}: {value:.4f} "
                 f"(n={len(values)}, {method})"
             )
+        return {
+            "dte_bucket": dte_bucket,
+            "missing_data": insufficient
+        }
 
-    def recalculate_for_underlying(self, underlying: str, dte_bucket: Optional[str] = None) -> None:
+    def recalculate_for_underlying(self, underlying: str, dte_bucket: Optional[str] = None) -> Dict[str, Dict]:
         """
         Пересчитать пороги для указанного underlying.
         Если dte_bucket не задан - пересчитывает все бины.
         """
         if not self.enabled:
             logger.info("Динамические пороги отключены (enabled=False)")
-            return
+            return {"underlying": underlying, "insufficient_bins": []}
+        insufficient_bins: List[Dict] = []
         if dte_bucket:
-            self._recalculate_thresholds(underlying, dte_bucket)
-            return
+            result = self._recalculate_thresholds(underlying, dte_bucket)
+            if result.get("missing_data"):
+                insufficient_bins.append(result)
+            return {"underlying": underlying, "insufficient_bins": insufficient_bins}
         for bucket in DTE_BINS:
-            self._recalculate_thresholds(underlying, bucket["label"])
+            result = self._recalculate_thresholds(underlying, bucket["label"])
+            if result.get("missing_data"):
+                insufficient_bins.append(result)
+        return {"underlying": underlying, "insufficient_bins": insufficient_bins}

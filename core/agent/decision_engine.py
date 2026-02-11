@@ -4,7 +4,7 @@ Decision Engine - движок принятия решений для торго
 """
 import logging
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, date
 
 from config import AGENT_CONFIG
 from core.data.database import get_database
@@ -146,7 +146,12 @@ class DecisionEngine:
                 }
             
             # Получаем динамические пороги (если доступны)
+            dte_bucket = self.dynamic_thresholds._primary_bucket_from_options(options_data)
             thresholds = self.dynamic_thresholds.get_thresholds_for_options(underlying, options_data)
+            dynamic_thresholds = {}
+            if dte_bucket:
+                dynamic_thresholds = self.db.get_strategy_thresholds(underlying, dte_bucket)
+            threshold_type = "dynamic" if dynamic_thresholds else "static"
 
             # Анализ IVR для каждого опциона
             # Используем новый подход с похожими опционами
@@ -180,7 +185,9 @@ class DecisionEngine:
                 'greeks_analysis': greeks_analysis,
                 'anomalies': anomalies,
                 'options_summary': options_summary,
-                'ivr_threshold': ivr_threshold
+                'ivr_threshold': ivr_threshold,
+                'dte_bucket': dte_bucket,
+                'threshold_type': threshold_type
             }
             
             logger.info(
@@ -258,6 +265,151 @@ class DecisionEngine:
         summary['expirations'] = list(summary['expirations'])
         
         return summary
+
+    def _group_options_by_expiration(self, options_data: Dict[str, Dict]) -> List[Dict[str, Any]]:
+        """
+        Группировать опционы по экспирациям, исключая days_to_expiration = 0.
+        """
+        grouped: Dict[str, Dict[str, Any]] = {}
+        today = date.today()
+        for symbol, data in options_data.items():
+            parts = symbol.split('-')
+            if len(parts) < 2:
+                continue
+            expiration = parts[1]
+            expiration_date = self.db.parse_expiration_date(expiration)
+            if not expiration_date:
+                continue
+            days_to_expiration = (expiration_date - today).days
+            if days_to_expiration == 0:
+                continue
+            if expiration not in grouped:
+                grouped[expiration] = {
+                    "expiration": expiration,
+                    "days_to_expiration": days_to_expiration,
+                    "options_data": {}
+                }
+            grouped[expiration]["options_data"][symbol] = data
+        # Сортируем по days_to_expiration
+        return sorted(grouped.values(), key=lambda item: item["days_to_expiration"])
+
+    def _save_signal(self, decision: Dict[str, Any]) -> None:
+        if not self.enable_signal_history:
+            return
+        try:
+            signal_data = {
+                'signal_type': decision.get('signal_type'),
+                'underlying': decision.get('underlying'),
+                'expiration': decision.get('expiration'),
+                'strike_call': decision.get('strike_call'),
+                'strike_put': decision.get('strike_put'),
+                'strike': decision.get('strike'),
+                'reasoning': decision.get('reasoning', ''),
+                'confidence': decision.get('confidence', 0.5),
+                'risk_level': decision.get('risk_level', 'medium'),
+                'agent_version': '1.0'
+            }
+            signal_id = self.db.save_signal(signal_data)
+            decision['signal_id'] = signal_id
+            logger.info(f"Сигнал сохранен в БД с ID={signal_id}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении сигнала в БД: {e}", exc_info=True)
+
+    def make_decisions(self, underlying: str) -> List[Dict[str, Any]]:
+        """
+        Принятие решений по каждой экспирации отдельно.
+        """
+        results: List[Dict[str, Any]] = []
+        try:
+            logger.info(f"🤖 Начало принятия решений для {underlying}")
+            if not self.agent:
+                logger.error("TradingAgent не инициализирован")
+                return results
+            if not self.agent.client:
+                logger.warning("DeepSeek клиент не инициализирован. Проверьте API ключ.")
+
+            collected_data = self.collect_data(underlying)
+            if collected_data.get('error'):
+                logger.error(f"Ошибка при сборе данных: {collected_data.get('error')}")
+                return results
+
+            grouped = self._group_options_by_expiration(collected_data.get('options_data', {}))
+            if not grouped:
+                logger.info(f"Нет подходящих экспираций для анализа {underlying}")
+                return results
+
+            for group in grouped:
+                expiration = group["expiration"]
+                options_data = group["options_data"]
+                # Пересчет динамических порогов (если требуется) на уровне экспирации
+                self.dynamic_thresholds.ensure_thresholds(underlying, options_data)
+
+                exp_collected = {
+                    'underlying': underlying,
+                    'underlying_price': collected_data.get('underlying_price', 0),
+                    'options_data': options_data,
+                    'options_count': len(options_data),
+                    'support_resistance': collected_data.get('support_resistance', {}),
+                    'timestamp': datetime.now().isoformat()
+                }
+
+                analysis_results = self.analyze_data(exp_collected)
+                if analysis_results.get('error'):
+                    logger.error(f"Ошибка при анализе данных: {analysis_results.get('error')}")
+                    results.append({
+                        "expiration": expiration,
+                        "decision": None,
+                        "threshold_type": analysis_results.get("threshold_type"),
+                        "dte_bucket": analysis_results.get("dte_bucket"),
+                        "error": analysis_results.get('error')
+                    })
+                    continue
+
+                market_data = {
+                    'underlying': underlying,
+                    'underlying_price': exp_collected.get('underlying_price', 0),
+                    'options_data': options_data,
+                    'ivr_analysis': analysis_results.get('ivr_analysis', {}),
+                    'greeks_analysis': analysis_results.get('greeks_analysis', {}),
+                    'anomalies': analysis_results.get('anomalies', {}),
+                    'support_resistance': exp_collected.get('support_resistance', {})
+                }
+
+                market_analysis = self.agent.analyze_market(market_data)
+                if market_analysis.get('error'):
+                    if market_analysis.get('skipped'):
+                        logger.info("Анализ рынка пропущен из-за недоступности API. Продолжаем без LLM анализа.")
+                    else:
+                        logger.warning(f"Ошибка при анализе рынка: {market_analysis.get('error')}")
+
+                decision_context = {
+                    'underlying': underlying,
+                    'underlying_price': exp_collected.get('underlying_price', 0),
+                    'market_analysis': market_analysis,
+                    'options_summary': analysis_results.get('options_summary', {}),
+                    'ivr_threshold': analysis_results.get('ivr_threshold'),
+                    'expiration': expiration
+                }
+
+                decision = self.agent.make_decision(decision_context)
+                if decision:
+                    if not decision.get('expiration'):
+                        decision['expiration'] = expiration
+                    decision['threshold_type'] = analysis_results.get('threshold_type')
+                    decision['dte_bucket'] = analysis_results.get('dte_bucket')
+                    self._save_signal(decision)
+
+                results.append({
+                    "expiration": expiration,
+                    "decision": decision,
+                    "threshold_type": analysis_results.get("threshold_type"),
+                    "dte_bucket": analysis_results.get("dte_bucket"),
+                })
+
+            return results
+        except Exception as e:
+            logger.error(f"Ошибка при принятии решений для {underlying}: {e}", exc_info=True)
+            return results
     
     def make_decision(self, underlying: str) -> Optional[Dict[str, Any]]:
         """
@@ -276,106 +428,11 @@ class DecisionEngine:
         Returns:
             Словарь с решением (сигналом) или None, если решение не принято
         """
-        try:
-            logger.info(f"🤖 Начало принятия решения для {underlying}")
-            
-            # Проверяем, что агент инициализирован
-            if not self.agent:
-                logger.error("TradingAgent не инициализирован")
-                return None
-            
-            if not self.agent.client:
-                logger.warning("DeepSeek клиент не инициализирован. Проверьте API ключ.")
-            
-            # Шаг 1: Сбор данных
-            logger.debug(f"Сбор данных для {underlying}")
-            collected_data = self.collect_data(underlying)
-            
-            if collected_data.get('error'):
-                logger.error(f"Ошибка при сборе данных: {collected_data.get('error')}")
-                return None
-            
-            # Пересчет динамических порогов (если требуется)
-            self.dynamic_thresholds.ensure_thresholds(
-                underlying,
-                collected_data.get('options_data', {})
-            )
-
-            # Шаг 2: Анализ данных
-            analysis_results = self.analyze_data(collected_data)
-            
-            if analysis_results.get('error'):
-                logger.error(f"Ошибка при анализе данных: {analysis_results.get('error')}")
-                return None
-            
-            # Шаг 3: Формируем данные для анализа рынка
-            market_data = {
-                'underlying': underlying,
-                'underlying_price': collected_data.get('underlying_price', 0),
-                'options_data': collected_data.get('options_data', {}),
-                'ivr_analysis': analysis_results.get('ivr_analysis', {}),
-                'greeks_analysis': analysis_results.get('greeks_analysis', {}),
-                'anomalies': analysis_results.get('anomalies', {}),
-                'support_resistance': collected_data.get('support_resistance', {})
-            }
-            
-            # Шаг 4: Анализ рынка через LLM
-            market_analysis = self.agent.analyze_market(market_data)
-            
-            if market_analysis.get('error'):
-                if market_analysis.get('skipped'):
-                    logger.info("Анализ рынка пропущен из-за недоступности API. Продолжаем без LLM анализа.")
-                else:
-                    logger.warning(f"Ошибка при анализе рынка: {market_analysis.get('error')}")
-                # Продолжаем, даже если анализ рынка не удался
-            
-            # Шаг 5: Формируем контекст для принятия решения
-            decision_context = {
-                'underlying': underlying,
-                'underlying_price': collected_data.get('underlying_price', 0),
-                'market_analysis': market_analysis,
-                'options_summary': analysis_results.get('options_summary', {}),
-                'ivr_threshold': analysis_results.get('ivr_threshold')
-            }
-            
-            # Шаг 6: Принятие решения через LLM
-            decision = self.agent.make_decision(decision_context)
-            
-            if not decision:
-                logger.info(f"Решение не принято для {underlying} (нет подходящих условий)")
-                return None
-            
-            # Шаг 7: Сохранение сигнала в БД (если включено)
-            if self.enable_signal_history:
-                try:
-                    signal_data = {
-                        'signal_type': decision.get('signal_type'),
-                        'underlying': decision.get('underlying'),
-                        'expiration': decision.get('expiration'),
-                        'strike_call': decision.get('strike_call'),
-                        'strike_put': decision.get('strike_put'),
-                        'strike': decision.get('strike'),
-                        'reasoning': decision.get('reasoning', ''),
-                        'confidence': decision.get('confidence', 0.5),
-                        'risk_level': decision.get('risk_level', 'medium'),
-                        'agent_version': '1.0'  # Можно сделать настраиваемым
-                    }
-                    signal_id = self.db.save_signal(signal_data)
-                    decision['signal_id'] = signal_id
-                    logger.info(f"Сигнал сохранен в БД с ID={signal_id}")
-                except Exception as e:
-                    logger.error(f"Ошибка при сохранении сигнала в БД: {e}", exc_info=True)
-            
-            logger.info(
-                f"Решение принято для {underlying}: {decision.get('signal_type')}, "
-                f"уверенность={decision.get('confidence', 0):.2f}"
-            )
-            
-            return decision
-            
-        except Exception as e:
-            logger.error(f"Ошибка при принятии решения для {underlying}: {e}", exc_info=True)
-            return None
+        decisions = self.make_decisions(underlying)
+        for item in decisions:
+            if item.get("decision"):
+                return item["decision"]
+        return None
 
 
 # Глобальный экземпляр Decision Engine
