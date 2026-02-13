@@ -9,10 +9,12 @@ from datetime import datetime, date
 from config import AGENT_CONFIG
 from core.data.database import get_database
 from core.data.historical_analyzer import get_historical_analyzer
+from core.data.option_board import parse_expiration_date
 from core.strategy.iv_filter import get_iv_filter
 from core.strategy.greeks_analyzer import get_greeks_analyzer
 from core.strategy.anomaly_detector import get_anomaly_detector
 from core.strategy.dynamic_thresholds import DynamicThresholds
+from core.strategy.gex_calculator import calculate_gex_by_strike, gex_summary_for_agent
 from core.agent.trading_agent import get_trading_agent
 
 logger = logging.getLogger(__name__)
@@ -180,11 +182,41 @@ class DecisionEngine:
             # Формируем сводку для опционов
             options_summary = self._create_options_summary(options_data, ivr_analysis)
             
+            # GEX (Gamma Exposure) только для дневных опционов (DTE <= 3)
+            gex_summary = None
+            try:
+                first_symbol = next(iter(options_data.keys()), None)
+                if first_symbol:
+                    parts = first_symbol.split('-')
+                    if len(parts) >= 2:
+                        expiry_str = parts[1]
+                        exp_date = parse_expiration_date(expiry_str)
+                        if exp_date:
+                            from datetime import date
+                            dte = (exp_date - date.today()).days
+                            if dte <= self.max_expiration_days:
+                                opts_for_gex = []
+                                for sym, d in options_data.items():
+                                    p = sym.split('-')
+                                    opt_type = p[3] if len(p) >= 4 else None
+                                    opts_for_gex.append({
+                                        'symbol': sym,
+                                        'open_interest': d.get('open_interest') or 0,
+                                        'gamma': d.get('gamma') or 0,
+                                        'days_to_expiration': dte,
+                                        'option_type': opt_type,
+                                    })
+                                gex_by_strike = calculate_gex_by_strike(opts_for_gex, max_dte=self.max_expiration_days)
+                                gex_summary = gex_summary_for_agent(gex_by_strike, top_n=5)
+            except Exception as gex_err:
+                logger.debug(f"GEX не рассчитан: {gex_err}")
+            
             result = {
                 'ivr_analysis': ivr_analysis,
                 'greeks_analysis': greeks_analysis,
                 'anomalies': anomalies,
                 'options_summary': options_summary,
+                'gex_summary': gex_summary,
                 'ivr_threshold': ivr_threshold,
                 'dte_bucket': dte_bucket,
                 'threshold_type': threshold_type
@@ -372,7 +404,8 @@ class DecisionEngine:
                     'ivr_analysis': analysis_results.get('ivr_analysis', {}),
                     'greeks_analysis': analysis_results.get('greeks_analysis', {}),
                     'anomalies': analysis_results.get('anomalies', {}),
-                    'support_resistance': exp_collected.get('support_resistance', {})
+                    'support_resistance': exp_collected.get('support_resistance', {}),
+                    'gex_summary': analysis_results.get('gex_summary'),
                 }
 
                 market_analysis = self.agent.analyze_market(market_data)

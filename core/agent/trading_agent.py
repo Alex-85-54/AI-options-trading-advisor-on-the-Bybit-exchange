@@ -264,6 +264,8 @@ class TradingAgent:
                 - recommendations: рекомендации от LLM
         """
         try:
+            gex_summary = data.get('gex_summary')
+            gex_info = json.dumps(gex_summary, indent=2, ensure_ascii=False) if gex_summary else "Не рассчитан (только для опционов с DTE ≤ 3)."
             # Формируем промпт для анализа рынка
             prompt = MARKET_ANALYSIS_PROMPT.format(
                 underlying=data.get('underlying', 'BTC'),
@@ -272,7 +274,8 @@ class TradingAgent:
                 ivr_info=json.dumps(data.get('ivr_analysis', {}), indent=2, ensure_ascii=False),
                 greeks_info=json.dumps(data.get('greeks_analysis', {}), indent=2, ensure_ascii=False),
                 anomalies_info=json.dumps(data.get('anomalies', {}), indent=2, ensure_ascii=False),
-                support_resistance=json.dumps(data.get('support_resistance', {}), indent=2, ensure_ascii=False)
+                support_resistance=json.dumps(data.get('support_resistance', {}), indent=2, ensure_ascii=False),
+                gex_info=gex_info
             )
             
             messages = [

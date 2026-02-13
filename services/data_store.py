@@ -7,7 +7,7 @@ from apscheduler.triggers.date import DateTrigger
 
 from core.data.database import get_database
 from core.data.option_board import is_otm
-from config import DISPLAY_TIMEZONE
+from config import DISPLAY_TIMEZONE, SUBSCRIPTION_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -101,42 +101,35 @@ class OptionDataStore:
 
     def save_to_database(self):
         """
-        Сохранить текущее состояние data_store в БД
+        Сохранить текущее состояние data_store в БД.
         
-        Важно: Сохраняются ТОЛЬКО OTM (Out of The Money) опционы.
-        ITM и ATM опционы фильтруются и не сохраняются в БД.
+        Если SUBSCRIPTION_CONFIG.save_only_otm = True: сохраняются только OTM опционы (is_otm=1).
+        Если save_only_otm = False: сохраняются все опционы (OTM+ITM+ATM), в БД проставляется is_otm.
         
         При сохранении автоматически вычисляются:
-        - expiration_date (из символа, например "4JAN26" -> date(2026, 1, 4))
-        - underlying_ticker (из символа, например "BTC")
-        - days_to_expiration (expiration_date - date_data_collection)
-        
-        Сохраняет только последние актуальные данные для каждого символа.
-        Обрабатывает ошибки БД без остановки работы.
+        - expiration_date (из символа), underlying_ticker, days_to_expiration
+        - is_otm (True для OTM, False для ITM/ATM)
         """
         if self._db is None:
             self._db = get_database()
         
-        # Получаем все данные (копия для безопасности)
         all_data = self.get_all()
-        
         if not all_data:
             logger.debug("Нет данных для сохранения в БД")
             return
         
+        save_only_otm = SUBSCRIPTION_CONFIG.get("save_only_otm", False)
         saved_count = 0
         error_count = 0
         
         try:
             for symbol, data in all_data.items():
                 try:
-                    # Фильтрация OTM опционов: сохраняем только OTM опционы
                     underlying_price = data.get('underlying_price')
                     if underlying_price is None or underlying_price <= 0:
                         logger.debug(f"Пропущен {symbol}: нет цены базового актива")
                         continue
                     
-                    # Парсим символ для получения страйка и типа опциона
                     parts = symbol.split('-')
                     if len(parts) < 5:
                         logger.debug(f"Пропущен {symbol}: неверный формат символа")
@@ -144,18 +137,16 @@ class OptionDataStore:
                     
                     try:
                         strike = int(parts[2])
-                        option_type = parts[3]  # 'C' или 'P'
+                        option_type = parts[3]
                     except (ValueError, IndexError):
                         logger.debug(f"Пропущен {symbol}: не удалось извлечь страйк или тип")
                         continue
                     
-                    # Проверяем, является ли опцион OTM
-                    if not is_otm(strike, underlying_price, option_type):
-                        logger.debug(f"Пропущен {symbol}: опцион не OTM (strike={strike}, underlying={underlying_price}, type={option_type})")
+                    otm = is_otm(strike, underlying_price, option_type)
+                    if save_only_otm and not otm:
+                        logger.debug(f"Пропущен {symbol}: save_only_otm=True и опцион не OTM")
                         continue
                     
-                    # Подготавливаем данные для сохранения
-                    # Убираем служебные поля, которые не нужны в БД
                     option_data = {
                         'ask_price': data.get('ask_price'),
                         'bid_price': data.get('bid_price'),
@@ -171,21 +162,19 @@ class OptionDataStore:
                         'volume_24h': data.get('volume_24h'),
                         'open_interest': data.get('open_interest'),
                         'underlying_price': underlying_price,
+                        'is_otm': otm,
                     }
                     
-                    # Используем timestamp из данных или текущее время
                     timestamp = data.get('timestamp')
                     if timestamp is None:
                         timestamp = datetime.now()
                     
-                    # Сохраняем в БД (timestamp будет округлен внутри save_option_data)
                     self._db.save_option_data(symbol, option_data, timestamp)
                     saved_count += 1
                     
                 except Exception as e:
                     logger.error(f"Ошибка при сохранении данных опциона {symbol} в БД: {e}", exc_info=True)
                     error_count += 1
-                    # Продолжаем сохранение других символов
             
             if saved_count > 0:
                 logger.info(f"Сохранено {saved_count} опционов в БД" + (f", ошибок: {error_count}" if error_count > 0 else ""))

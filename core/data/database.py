@@ -260,9 +260,18 @@ class OptionDatabase:
                     volume_24h REAL,
                     open_interest REAL,
                     underlying_price REAL,
+                    is_otm INTEGER NOT NULL DEFAULT 1,
                     UNIQUE(symbol, date_data_collection)
                 )
             """)
+            
+            # Миграция: добавить is_otm в существующие БД (для записей до внедрения GEX проставляем True)
+            cursor.execute("PRAGMA table_info(option_history)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if 'is_otm' not in columns:
+                cursor.execute("ALTER TABLE option_history ADD COLUMN is_otm INTEGER NOT NULL DEFAULT 1")
+                cursor.execute("UPDATE option_history SET is_otm = 1 WHERE is_otm IS NULL")
+                logger.info("Миграция option_history: добавлена колонка is_otm, существующие записи помечены is_otm=1")
             
             # Индексы для option_history
             cursor.execute("""
@@ -284,6 +293,26 @@ class OptionDatabase:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_option_history_underlying_days 
                 ON option_history(underlying_ticker, days_to_expiration)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_option_history_is_otm 
+                ON option_history(is_otm)
+            """)
+            
+            # Таблица пресетов GEX (тикер + дата экспирации по пользователю)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS gex_presets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    underlying TEXT NOT NULL,
+                    expiration_str TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, underlying, expiration_str)
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_gex_presets_user_id 
+                ON gex_presets(user_id)
             """)
             
             # Таблица истории базовых активов
@@ -452,6 +481,7 @@ class OptionDatabase:
                 - delta, gamma, vega, theta
                 - volume_24h, open_interest
                 - underlying_price
+                - is_otm: bool (True для OTM, False для ITM/ATM) — для фильтрации в не-GEX расчётах
             timestamp: Временная метка. Если None, используется текущее время.
                      Автоматически округляется до минут, кратных 5.
         """
@@ -483,14 +513,15 @@ class OptionDatabase:
             # Используем mark_iv как основную IV, если она есть, иначе используем iv
             iv = option_data.get('mark_iv') or option_data.get('iv') or option_data.get('ask_iv') or option_data.get('bid_iv')
             
+            is_otm = 1 if option_data.get('is_otm', True) else 0
             cursor.execute("""
                 INSERT OR REPLACE INTO option_history (
                     symbol, date_data_collection, expiration_date, underlying_ticker, days_to_expiration,
                     ask_price, bid_price, mark_price,
                     iv, ask_iv, bid_iv, mark_iv,
                     delta, gamma, vega, theta,
-                    volume_24h, open_interest, underlying_price
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    volume_24h, open_interest, underlying_price, is_otm
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol,
                 date_data_collection_str,
@@ -510,7 +541,8 @@ class OptionDatabase:
                 option_data.get('theta'),
                 option_data.get('volume_24h'),
                 option_data.get('open_interest'),
-                option_data.get('underlying_price')
+                option_data.get('underlying_price'),
+                is_otm
             ))
             
             # Сохраняем IV в отдельную таблицу для быстрого доступа
@@ -562,7 +594,7 @@ class OptionDatabase:
             query = """
                 SELECT date_data_collection, delta, gamma, vega, theta, iv, mark_price
                 FROM option_history
-                WHERE symbol = ? AND date_data_collection >= ?
+                WHERE symbol = ? AND date_data_collection >= ? AND is_otm = 1
                 ORDER BY date_data_collection ASC
             """
             params = (symbol, since_local)
@@ -599,7 +631,7 @@ class OptionDatabase:
             
             query = """
                 SELECT iv FROM option_history
-                WHERE symbol = ? AND date_data_collection >= ? AND iv IS NOT NULL
+                WHERE symbol = ? AND date_data_collection >= ? AND iv IS NOT NULL AND is_otm = 1
                 ORDER BY date_data_collection ASC
             """
             params = (symbol, since_local)
@@ -688,7 +720,7 @@ class OptionDatabase:
                 WHERE underlying_ticker = ? 
                   AND days_to_expiration = ?
                   AND date_data_collection >= ? 
-                  AND iv IS NOT NULL
+                  AND iv IS NOT NULL AND is_otm = 1
                 ORDER BY date_data_collection ASC
             """
             since_local = self._format_local_datetime(since)
@@ -816,7 +848,7 @@ class OptionDatabase:
         try:
             query = """
                 SELECT * FROM option_history
-                WHERE underlying_ticker = ? AND days_to_expiration = ?
+                WHERE underlying_ticker = ? AND days_to_expiration = ? AND is_otm = 1
                 ORDER BY date_data_collection DESC
             """
             params = [underlying_ticker, days_to_expiration]
@@ -864,7 +896,7 @@ class OptionDatabase:
                 SELECT * FROM option_history
                 WHERE underlying_ticker = ? 
                   AND expiration_date = ?
-                  AND date_data_collection >= ?
+                  AND date_data_collection >= ? AND is_otm = 1
                 ORDER BY date_data_collection ASC
             """, (underlying_ticker, expiration_date.isoformat(), since_local))
             
@@ -1147,7 +1179,8 @@ class OptionDatabase:
                 'support_resistance_levels',
                 'agent_signals',
                 'signal_results',
-                'strategy_thresholds'
+                'strategy_thresholds',
+                'gex_presets'
             ]
             
             total = 0
@@ -1197,6 +1230,7 @@ class OptionDatabase:
                 'agent_signals': 0,
                 'signal_results': 0,
                 'strategy_thresholds': 0,
+                'gex_presets': 0,
                 'total': 0,
                 'db_size_mb': 0.0,
                 'last_update': None
@@ -1311,7 +1345,7 @@ class OptionDatabase:
                 FROM option_history
                 WHERE underlying_ticker = ?
                   AND days_to_expiration >= ?
-                  AND date_data_collection >= ?
+                  AND date_data_collection >= ? AND is_otm = 1
             """
             params: List = [underlying, min_dte, since_local]
             if max_dte is not None:
@@ -1325,6 +1359,90 @@ class OptionDatabase:
         except sqlite3.Error as e:
             logger.error(f"Ошибка при получении истории опционов для порогов: {e}")
             raise
+        finally:
+            conn.close()
+
+    def get_options_for_gex(
+        self,
+        underlying_ticker: str,
+        expiration_date: date,
+        max_dte: int = 3
+    ) -> List[Dict]:
+        """
+        Получить опционы для расчёта GEX (OTM + ITM + ATM, без фильтра is_otm).
+        Только с days_to_expiration <= max_dte (по умолчанию 3 — дневные опционы).
+        Возвращает последний срез по date_data_collection.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT o.* FROM option_history o
+                INNER JOIN (
+                    SELECT MAX(date_data_collection) AS last_ts
+                    FROM option_history
+                    WHERE underlying_ticker = ? AND expiration_date = ? AND days_to_expiration <= ?
+                ) t ON o.date_data_collection = t.last_ts
+                WHERE o.underlying_ticker = ? AND o.expiration_date = ? AND o.days_to_expiration <= ?
+                ORDER BY o.symbol
+            """, (underlying_ticker, expiration_date.isoformat(), max_dte,
+                  underlying_ticker, expiration_date.isoformat(), max_dte))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении опционов для GEX: {e}")
+            raise
+        finally:
+            conn.close()
+
+    def add_gex_preset(self, user_id: int, underlying: str, expiration_str: str) -> bool:
+        """Добавить пресет GEX (тикер + дата экспирации). Возвращает True если добавлен."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO gex_presets (user_id, underlying, expiration_str)
+                VALUES (?, ?, ?)
+            """, (user_id, underlying.upper(), expiration_str.upper()))
+            conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при добавлении пресета GEX: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def get_gex_presets(self, user_id: int) -> List[Dict]:
+        """Получить список пресетов GEX пользователя."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT id, user_id, underlying, expiration_str, created_at
+                FROM gex_presets WHERE user_id = ?
+                ORDER BY underlying, expiration_str
+            """, (user_id,))
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении пресетов GEX: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def delete_gex_preset(self, user_id: int, preset_id: int) -> bool:
+        """Удалить пресет GEX по id. Возвращает True если удалён."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM gex_presets WHERE id = ? AND user_id = ?", (preset_id, user_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при удалении пресета GEX: {e}")
+            conn.rollback()
+            return False
         finally:
             conn.close()
 

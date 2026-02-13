@@ -117,31 +117,22 @@ Unit тесты для анализаторов
 5. Детали реализации
 5.1. Схема базы данных SQLite
 
-**Важно:** В базу данных сохраняются ТОЛЬКО OTM (Out of The Money) опционы. ITM и ATM опционы не сохраняются для экономии памяти.
+**Важно:** Режим сохранения опционов задаётся в `SUBSCRIPTION_CONFIG.save_only_otm`. При `save_only_otm = False` в БД сохраняются все опционы (OTM+ITM+ATM) с полем `is_otm` (1 = OTM, 0 = ITM/ATM). Для расчётов, не связанных с GEX, во всех запросах используется фильтр `is_otm = 1`. Для расчёта GEX используются все опционы (OTM+ITM+ATM), только с days_to_expiration ≤ 3.
 
 -- История опционов
 ```sql
 CREATE TABLE option_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL,
-    date_data_collection DATETIME NOT NULL,  -- дата и время сбора данных (округлено до 5 минут, UTC+7)
-    expiration_date DATE NOT NULL,           -- дата экспирации опциона (извлечена из symbol)
-    underlying_ticker TEXT NOT NULL,          -- базовый актив (BTC, ETH, SOL)
-    days_to_expiration INTEGER,               -- вычисляемое поле: expiration_date - date_data_collection
-    ask_price REAL,
-    bid_price REAL,
-    mark_price REAL,
-    iv REAL,                                  -- основная IV (mark_iv или ask_iv/bid_iv)
-    ask_iv REAL,
-    bid_iv REAL,
-    mark_iv REAL,
-    delta REAL,
-    gamma REAL,
-    vega REAL,
-    theta REAL,
-    volume_24h REAL,
-    open_interest REAL,
-    underlying_price REAL,
+    date_data_collection DATETIME NOT NULL,
+    expiration_date DATE NOT NULL,
+    underlying_ticker TEXT NOT NULL,
+    days_to_expiration INTEGER,
+    ask_price REAL, bid_price REAL, mark_price REAL,
+    iv REAL, ask_iv REAL, bid_iv REAL, mark_iv REAL,
+    delta REAL, gamma REAL, vega REAL, theta REAL,
+    volume_24h REAL, open_interest REAL, underlying_price REAL,
+    is_otm INTEGER NOT NULL DEFAULT 1,
     UNIQUE(symbol, date_data_collection)
 );
 
@@ -151,6 +142,19 @@ CREATE INDEX idx_option_history_date_data_collection ON option_history(date_data
 CREATE INDEX idx_option_history_underlying_expiration ON option_history(underlying_ticker, expiration_date);
 CREATE INDEX idx_option_history_days_to_expiration ON option_history(days_to_expiration);
 CREATE INDEX idx_option_history_underlying_days ON option_history(underlying_ticker, days_to_expiration);
+CREATE INDEX idx_option_history_is_otm ON option_history(is_otm);
+```
+
+-- Пресеты GEX (тикер + дата экспирации по пользователю Telegram)
+```sql
+CREATE TABLE gex_presets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    underlying TEXT NOT NULL,
+    expiration_str TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, underlying, expiration_str)
+);
 ```
 
 -- История базовых активов

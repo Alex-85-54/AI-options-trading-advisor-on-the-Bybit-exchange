@@ -39,7 +39,7 @@ SUBSCRIPTION_CONFIG = {
     "daily_update_time_utc": "15:05",      # Время обновления подписок
     "skip_today_expiration": False,        # Собираем данные до экспирации (days_to_expiration = 0)
     "new_options_time_utc": "15:05",       # Время добавления новых опционов на бирже
-    "save_only_otm": True,                 # Сохранять только OTM опционы
+    "save_only_otm": False,               # Сохранять все опционы (OTM+ITM+ATM) для GEX; is_otm в БД для фильтра в остальных расчётах
     "refresh_job_timeout_sec": 120,         # Таймаут задачи переподписки (сек); после него задача считается завершённой
     "http_request_timeout_sec": 30,       # Таймаут HTTP-запросов к бирже (доска опционов)
 }

@@ -1,4 +1,4 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
@@ -25,6 +25,11 @@ from core.data.option_board import get_option_board
 from core.data.database import get_database
 from core.agent.decision_engine import get_decision_engine
 from core.agent.trading_agent import get_trading_agent
+from core.strategy.gex_calculator import (
+    options_from_datastore_for_gex,
+    calculate_gex_by_strike,
+    build_gex_chart_png,
+)
 from utils.logging_config import setup_service_logging
 
 # Настройка логирования с ротацией файлов
@@ -74,14 +79,19 @@ CHECK_INTERVAL = 5  # Интервал проверки в секундах
     WAITING_FOR_DATA,
     CHOOSING_LEVEL_TYPE,
     ENTERING_LEVEL_PRICE,
-    REMOVING_LEVEL
-) = range(11)
+    REMOVING_LEVEL,
+    GEX_CHOOSING_UNDERLYING,
+    GEX_ENTERING_DAY,
+    GEX_CHOOSING_MONTH,
+) = range(14)
 
 # Константы
 CANCEL_TEXT = "❌ Отмена"
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 UNDERLYING_ASSETS = ["BTC"]
+# Текст кнопки быстрого доступа в главное меню (Reply-клавиатура и обработка сообщения)
+MENU_BUTTON_TEXT = "🏠 Меню"
 
 
 def escape_html(text: str) -> str:
@@ -147,15 +157,18 @@ class TelegramOptionBot:
         - 💼 Управление позицией: Добавить опцион, Удалить опцион, Статус мониторинга, 
           Запустить мониторинг, Остановить мониторинг, Текущие цены, Активные сигналы
         """
-        # Группа "Аналитика" (синяя группа - используем эмодзи для визуального выделения)
+        # Группа "Аналитика"
         analytics_group = [
             [
                 InlineKeyboardButton("🤖 Агент", callback_data="agent_status"),
                 InlineKeyboardButton("📊 Уровни S/R", callback_data="set_levels")
+            ],
+            [
+                InlineKeyboardButton("📈 GEX", callback_data="gex_menu")
             ]
         ]
         
-        # Группа "Управление позицией" (зеленая группа)
+        # Группа "Управление позицией"
         position_management_group = [
             [
                 InlineKeyboardButton("➕ Добавить опцион", callback_data="add_option"),
@@ -173,20 +186,24 @@ class TelegramOptionBot:
                 InlineKeyboardButton("🚨 Активные сигналы", callback_data="active_signals")
             ]
         ]
-        
-        # Объединяем группы и добавляем кнопку помощи
         return analytics_group + position_management_group + [
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
         ]
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start - главное меню"""
-        user = update.effective_user
+    def _get_menu_reply_keyboard(self) -> ReplyKeyboardMarkup:
+        """Клавиатура с кнопкой быстрого доступа в главное меню (одно нажатие — сразу меню)."""
+        return ReplyKeyboardMarkup(
+            [[KeyboardButton(MENU_BUTTON_TEXT)]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
 
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start — главное меню и кнопка быстрого доступа."""
+        user = update.effective_user
+        chat_id = update.message.chat_id
         keyboard = self._get_main_menu_keyboard()
         reply_markup = InlineKeyboardMarkup(keyboard)
-
-        # Добавляем заголовки групп в текст сообщения для визуального разделения
         message_text = (
             f"👋 Привет, {user.first_name}!\n\n"
             "Я бот для отслеживания опционов Bybit.\n"
@@ -196,7 +213,31 @@ class TelegramOptionBot:
             "💼 <b>Управление позицией</b>\n"
             "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
         )
+        await update.message.reply_text(
+            message_text,
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="👇 Нажмите кнопку ниже для быстрого перехода в главное меню",
+            reply_markup=self._get_menu_reply_keyboard()
+        )
+        return CHOOSING_ACTION
 
+    async def show_main_menu_for_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать главное меню в ответ на кнопку «Меню» — без лишнего шага с /start."""
+        user = update.effective_user
+        keyboard = self._get_main_menu_keyboard()
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        message_text = (
+            f"👋 <b>Главное меню</b>\n\n"
+            f"Пользователь: {user.first_name}\n\n"
+            "📊 <b>Аналитика</b>\n"
+            "Агент | Уровни S/R | GEX\n\n"
+            "💼 <b>Управление позицией</b>\n"
+            "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
+        )
         await update.message.reply_text(
             message_text,
             parse_mode='HTML',
@@ -266,6 +307,20 @@ class TelegramOptionBot:
             return await self.handle_type_selection(update, context)
         elif action.startswith("remove_"):
             return await self.handle_removal_selection(update, context)
+        elif action == "gex_menu":
+            return await self.gex_show_menu(update, context)
+        elif action == "gex_add_preset":
+            return await self.gex_start_add_preset(update, context)
+        elif action == "gex_list_presets":
+            return await self.gex_list_presets(update, context)
+        elif action == "gex_calc":
+            return await self.gex_calculate_all(update, context)
+        elif action.startswith("gex_underlying_"):
+            return await self.gex_handle_underlying(update, context)
+        elif action.startswith("gex_month_"):
+            return await self.gex_handle_month(update, context)
+        elif action.startswith("gex_del_"):
+            return await self.gex_handle_delete_preset(update, context)
 
         return CHOOSING_ACTION
 
@@ -359,6 +414,196 @@ class TelegramOptionBot:
                 reply_markup=reply_markup
             )
 
+        return CHOOSING_ACTION
+
+    # ===== GEX (Gamma Exposure) =====
+
+    async def gex_show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать меню GEX: пресеты и расчёт."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if query:
+            await query.answer()
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить пресет GEX", callback_data="gex_add_preset")],
+            [InlineKeyboardButton("📋 Список пресетов", callback_data="gex_list_presets")],
+            [InlineKeyboardButton("📊 Рассчитать GEX", callback_data="gex_calc")],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = (
+            "📈 <b>GEX (Gamma Exposure)</b>\n\n"
+            "Пресет = тикер + дата экспирации. По нажатию «Рассчитать GEX» строится график по текущей доске опционов для каждого пресета (только опционы с DTE ≤ 3)."
+        )
+        if query:
+            await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=reply_markup)
+        return CHOOSING_ACTION
+
+    async def gex_start_add_preset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начать добавление пресета GEX: выбор тикера."""
+        query = update.callback_query
+        await query.answer()
+        keyboard = []
+        for asset in UNDERLYING_ASSETS:
+            keyboard.append([InlineKeyboardButton(asset, callback_data=f"gex_underlying_{asset}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "📈 <b>Добавление пресета GEX</b>\n\nВыберите базовый актив (тикер):",
+            parse_mode='HTML',
+            reply_markup=reply_markup
+        )
+        return GEX_CHOOSING_UNDERLYING
+
+    async def gex_handle_underlying(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить тикер пресета и запросить день экспирации."""
+        query = update.callback_query
+        await query.answer()
+        underlying = query.data.replace("gex_underlying_", "")
+        context.user_data["gex_underlying"] = underlying
+        await query.edit_message_text(
+            f"📈 Пресет GEX: <b>{underlying}</b>\n\nВведите число месяца экспирации (1–31):",
+            parse_mode='HTML'
+        )
+        return GEX_ENTERING_DAY
+
+    async def gex_handle_day_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода дня для пресета GEX."""
+        text = update.message.text.strip()
+        if not text.isdigit():
+            await update.message.reply_text("❌ Введите число от 1 до 31.")
+            return GEX_ENTERING_DAY
+        day_num = int(text)
+        if day_num < 1 or day_num > 31:
+            await update.message.reply_text("❌ День должен быть от 1 до 31.")
+            return GEX_ENTERING_DAY
+        context.user_data["gex_day"] = day_num
+        keyboard = []
+        for month in MONTHS:
+            keyboard.append([InlineKeyboardButton(month, callback_data=f"gex_month_{month}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"📈 Пресет GEX: {context.user_data.get('gex_underlying')}, день {day_num}\n\nВыберите месяц экспирации:",
+            reply_markup=reply_markup
+        )
+        return GEX_CHOOSING_MONTH
+
+    async def gex_handle_month(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сохранить пресет GEX (тикер + дата экспирации) и вернуться в меню GEX."""
+        query = update.callback_query
+        await query.answer()
+        month = query.data.replace("gex_month_", "")
+        underlying = context.user_data.get("gex_underlying", "")
+        day = context.user_data.get("gex_day", 1)
+        year_suffix = CONFIG.get("expiration_year", "26")
+        expiration_str = f"{day}{month}{year_suffix}"
+        added = self.db.add_gex_preset(query.from_user.id, underlying, expiration_str)
+        if added:
+            await query.edit_message_text(
+                f"✅ Пресет добавлен: <b>{underlying}</b> {expiration_str}",
+                parse_mode='HTML'
+            )
+        else:
+            await query.edit_message_text(
+                f"ℹ️ Пресет уже есть: <b>{underlying}</b> {expiration_str}",
+                parse_mode='HTML'
+            )
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить пресет GEX", callback_data="gex_add_preset")],
+            [InlineKeyboardButton("📋 Список пресетов", callback_data="gex_list_presets")],
+            [InlineKeyboardButton("📊 Рассчитать GEX", callback_data="gex_calc")],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
+        ]
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="📈 Меню GEX",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return ConversationHandler.END
+
+    async def gex_list_presets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать список пресетов GEX с кнопками удаления."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if query:
+            await query.answer()
+        presets = self.db.get_gex_presets(user_id)
+        if not presets:
+            text = "📋 Пресетов GEX пока нет. Добавьте пресет (тикер + дата экспирации)."
+            keyboard = [[InlineKeyboardButton("➕ Добавить пресет", callback_data="gex_add_preset")]]
+        else:
+            text = "📋 <b>Пресеты GEX</b>\n\nНажмите на пресет, чтобы удалить:"
+            keyboard = []
+            for p in presets:
+                label = f"{p['underlying']} {p['expiration_str']}"
+                keyboard.append([InlineKeyboardButton(f"🗑 {label}", callback_data=f"gex_del_{p['id']}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if query:
+            await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=reply_markup)
+        return CHOOSING_ACTION
+
+    async def gex_handle_delete_preset(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Удалить пресет GEX по id."""
+        query = update.callback_query
+        await query.answer()
+        try:
+            preset_id = int(query.data.replace("gex_del_", ""))
+        except ValueError:
+            return await self.gex_list_presets(update, context)
+        deleted = self.db.delete_gex_preset(query.from_user.id, preset_id)
+        if deleted:
+            await query.edit_message_text("✅ Пресет удалён.")
+        else:
+            await query.edit_message_text("❌ Не удалось удалить пресет.")
+        return await self.gex_list_presets(update, context)
+
+    async def gex_calculate_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Рассчитать GEX по всем пресетам пользователя и отправить графики."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if query:
+            await query.answer()
+        presets = self.db.get_gex_presets(user_id)
+        if not presets:
+            if query:
+                await query.edit_message_text(
+                    "📊 Нет пресетов GEX. Добавьте пресет (тикер + дата экспирации), затем нажмите «Рассчитать GEX»."
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="📊 Нет пресетов GEX. Добавьте пресет, затем нажмите «Рассчитать GEX»."
+                )
+            return CHOOSING_ACTION
+        all_data = data_store.get_all()
+        sent = 0
+        for p in presets:
+            underlying = p["underlying"]
+            exp_str = p["expiration_str"]
+            opts = options_from_datastore_for_gex(all_data, underlying, exp_str)
+            if not opts:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ {underlying} {exp_str}: нет данных в текущей доске (подпишитесь на опционы или подождите обновления)."
+                )
+                continue
+            gex_by_strike = calculate_gex_by_strike(opts)
+            underlying_price = None
+            for sym, d in all_data.items():
+                if sym.startswith(f"{underlying}-{exp_str}-") and d.get("underlying_price"):
+                    underlying_price = d["underlying_price"]
+                    break
+            title = f"GEX {underlying} {exp_str}"
+            png_bytes = build_gex_chart_png(gex_by_strike, title=title, underlying_price=underlying_price)
+            await context.bot.send_photo(chat_id=chat_id, photo=png_bytes, caption=title)
+            sent += 1
+        if query and sent == 0:
+            await query.edit_message_text("📊 По пресетам нет данных для расчёта GEX (нет опционов в доске с DTE ≤ 3).")
+        elif query and sent > 0:
+            await query.edit_message_text(f"✅ Отправлено графиков GEX: {sent}")
         return CHOOSING_ACTION
 
     # ===== ДОБАВЛЕНИЕ ОПЦИОНА =====
@@ -2335,7 +2580,14 @@ class TelegramOptionBot:
             ]
         )
 
-        # Основной обработчик для главного меню
+        # Кнопка «Меню» и команда /menu — быстрый доступ в главное меню без лишнего шага с /start
+        application.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & filters.Regex(f"^({re.escape(MENU_BUTTON_TEXT)}|Меню)$"),
+                self.show_main_menu_for_message,
+            )
+        )
+        application.add_handler(CommandHandler("menu", self.show_main_menu_for_message))
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("help", self.show_help))
         application.add_handler(CommandHandler("monitoring_status", self.show_monitoring_status))
@@ -2353,6 +2605,31 @@ class TelegramOptionBot:
         application.add_handler(CommandHandler("set_levels", self.start_set_levels))
 
         # Добавляем ConversationHandler'ы
+        # ConversationHandler для добавления пресета GEX (тикер + дата экспирации)
+        gex_add_conv = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(self.gex_start_add_preset, pattern="^gex_add_preset$")
+            ],
+            states={
+                GEX_CHOOSING_UNDERLYING: [
+                    CallbackQueryHandler(self.gex_handle_underlying, pattern="^gex_underlying_"),
+                    CallbackQueryHandler(self.gex_show_menu, pattern="^gex_menu$")
+                ],
+                GEX_ENTERING_DAY: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.gex_handle_day_input)
+                ],
+                GEX_CHOOSING_MONTH: [
+                    CallbackQueryHandler(self.gex_handle_month, pattern="^gex_month_"),
+                    CallbackQueryHandler(self.gex_show_menu, pattern="^gex_menu$")
+                ]
+            },
+            fallbacks=[
+                CallbackQueryHandler(self.gex_show_menu, pattern="^gex_menu$"),
+                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+            ]
+        )
+        application.add_handler(gex_add_conv)
+
         application.add_handler(add_option_conv)
         application.add_handler(remove_option_conv)
         application.add_handler(set_levels_conv)
@@ -2371,6 +2648,15 @@ class TelegramOptionBot:
         application.add_handler(CallbackQueryHandler(self.handle_callback, pattern="^active_signals$"))
         logger.info("✅ Общий обработчик callback зарегистрирован")
 
+
+        # Команды в меню Telegram (иконка рядом с полем ввода) — «Меню» первым для быстрого доступа
+        async def set_bot_commands(app: Application):
+            await app.bot.set_my_commands([
+                BotCommand("menu", "Главное меню"),
+                BotCommand("start", "Старт"),
+                BotCommand("help", "Помощь"),
+            ])
+        application.post_init = set_bot_commands
 
         # Автоматическая подписка на опционы при старте
         self._auto_subscribe_on_startup()
