@@ -247,6 +247,20 @@ async def root():
     return {"service": "Option Data Service", "status": "running"}
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Отдаём пустой ответ 204 — убирает 404 в логах при открытии админки в браузере."""
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    """Запрет индексации для ботов — уменьшает запросы к несуществующим путям."""
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
+
+
 @app.get("/health")
 async def health_check():
     """Проверка здоровья сервиса"""
