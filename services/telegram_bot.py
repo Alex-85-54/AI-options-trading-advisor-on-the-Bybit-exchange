@@ -29,6 +29,8 @@ from core.strategy.gex_calculator import (
     options_from_datastore_for_gex,
     calculate_gex_by_strike,
     build_gex_chart_png,
+    build_iv_chart_png,
+    build_oi_chart_png,
 )
 from utils.logging_config import setup_service_logging
 
@@ -164,7 +166,7 @@ class TelegramOptionBot:
                 InlineKeyboardButton("📊 Уровни S/R", callback_data="set_levels")
             ],
             [
-                InlineKeyboardButton("📈 GEX", callback_data="gex_menu")
+                InlineKeyboardButton("📈 Расчёт индикаторов", callback_data="gex_menu")
             ]
         ]
         
@@ -234,7 +236,7 @@ class TelegramOptionBot:
             f"👋 <b>Главное меню</b>\n\n"
             f"Пользователь: {user.first_name}\n\n"
             "📊 <b>Аналитика</b>\n"
-            "Агент | Уровни S/R | GEX\n\n"
+            "Агент | Уровни S/R | Расчёт индикаторов\n\n"
             "💼 <b>Управление позицией</b>\n"
             "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
         )
@@ -424,15 +426,15 @@ class TelegramOptionBot:
         if query:
             await query.answer()
         keyboard = [
-            [InlineKeyboardButton("➕ Добавить пресет GEX", callback_data="gex_add_preset")],
-            [InlineKeyboardButton("📋 Список пресетов", callback_data="gex_list_presets")],
-            [InlineKeyboardButton("📊 Рассчитать GEX", callback_data="gex_calc")],
+            [InlineKeyboardButton("➕ Добавить экспирацию", callback_data="gex_add_preset")],
+            [InlineKeyboardButton("📋 Список экспираций", callback_data="gex_list_presets")],
+            [InlineKeyboardButton("📊 Рассчитать индикаторы", callback_data="gex_calc")],
             [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         text = (
-            "📈 <b>GEX (Gamma Exposure)</b>\n\n"
-            "Пресет = тикер + дата экспирации. По нажатию «Рассчитать GEX» строится график по текущей доске опционов для каждого пресета (только опционы с DTE ≤ 3)."
+            "📈 <b>Расчёт индикаторов</b>\n\n"
+            "Экспирация = тикер + дата. По нажатию «Рассчитать индикаторы» строятся графики GEX, IV (ATM) и OI по каждой добавленной экспирации (опционы с DTE ≤ 3)."
         )
         if query:
             await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
@@ -450,7 +452,7 @@ class TelegramOptionBot:
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            "📈 <b>Добавление пресета GEX</b>\n\nВыберите базовый актив (тикер):",
+            "📈 <b>Добавление экспирации</b>\n\nВыберите базовый актив (тикер):",
             parse_mode='HTML',
             reply_markup=reply_markup
         )
@@ -463,7 +465,7 @@ class TelegramOptionBot:
         underlying = query.data.replace("gex_underlying_", "")
         context.user_data["gex_underlying"] = underlying
         await query.edit_message_text(
-            f"📈 Пресет GEX: <b>{underlying}</b>\n\nВведите число месяца экспирации (1–31):",
+            f"📈 Экспирация: <b>{underlying}</b>\n\nВведите число месяца экспирации (1–31):",
             parse_mode='HTML'
         )
         return GEX_ENTERING_DAY
@@ -485,7 +487,7 @@ class TelegramOptionBot:
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"📈 Пресет GEX: {context.user_data.get('gex_underlying')}, день {day_num}\n\nВыберите месяц экспирации:",
+            f"📈 Экспирация: {context.user_data.get('gex_underlying')}, день {day_num}\n\nВыберите месяц экспирации:",
             reply_markup=reply_markup
         )
         return GEX_CHOOSING_MONTH
@@ -502,23 +504,23 @@ class TelegramOptionBot:
         added = self.db.add_gex_preset(query.from_user.id, underlying, expiration_str)
         if added:
             await query.edit_message_text(
-                f"✅ Пресет добавлен: <b>{underlying}</b> {expiration_str}",
+                f"✅ Экспирация добавлена: <b>{underlying}</b> {expiration_str}",
                 parse_mode='HTML'
             )
         else:
             await query.edit_message_text(
-                f"ℹ️ Пресет уже есть: <b>{underlying}</b> {expiration_str}",
+                f"ℹ️ Экспирация уже есть: <b>{underlying}</b> {expiration_str}",
                 parse_mode='HTML'
             )
         keyboard = [
-            [InlineKeyboardButton("➕ Добавить пресет GEX", callback_data="gex_add_preset")],
-            [InlineKeyboardButton("📋 Список пресетов", callback_data="gex_list_presets")],
-            [InlineKeyboardButton("📊 Рассчитать GEX", callback_data="gex_calc")],
+            [InlineKeyboardButton("➕ Добавить экспирацию", callback_data="gex_add_preset")],
+            [InlineKeyboardButton("📋 Список экспираций", callback_data="gex_list_presets")],
+            [InlineKeyboardButton("📊 Рассчитать индикаторы", callback_data="gex_calc")],
             [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
         ]
         await context.bot.send_message(
             chat_id=query.message.chat_id,
-            text="📈 Меню GEX",
+            text="📈 Расчёт индикаторов",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return ConversationHandler.END
@@ -530,10 +532,10 @@ class TelegramOptionBot:
             await query.answer()
         presets = self.db.get_gex_presets(user_id)
         if not presets:
-            text = "📋 Пресетов GEX пока нет. Добавьте пресет (тикер + дата экспирации)."
-            keyboard = [[InlineKeyboardButton("➕ Добавить пресет", callback_data="gex_add_preset")]]
+            text = "📋 Экспираций пока нет. Добавьте экспирацию (тикер + дата)."
+            keyboard = [[InlineKeyboardButton("➕ Добавить экспирацию", callback_data="gex_add_preset")]]
         else:
-            text = "📋 <b>Пресеты GEX</b>\n\nНажмите на пресет, чтобы удалить:"
+            text = "📋 <b>Список экспираций</b>\n\nНажмите на экспирацию, чтобы удалить:"
             keyboard = []
             for p in presets:
                 label = f"{p['underlying']} {p['expiration_str']}"
@@ -556,9 +558,9 @@ class TelegramOptionBot:
             return await self.gex_list_presets(update, context)
         deleted = self.db.delete_gex_preset(query.from_user.id, preset_id)
         if deleted:
-            await query.edit_message_text("✅ Пресет удалён.")
+            await query.edit_message_text("✅ Экспирация удалена.")
         else:
-            await query.edit_message_text("❌ Не удалось удалить пресет.")
+            await query.edit_message_text("❌ Не удалось удалить экспирацию.")
         return await self.gex_list_presets(update, context)
 
     async def gex_calculate_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -570,12 +572,12 @@ class TelegramOptionBot:
         if not presets:
             if query:
                 await query.edit_message_text(
-                    "📊 Нет пресетов GEX. Добавьте пресет (тикер + дата экспирации), затем нажмите «Рассчитать GEX»."
+                    "📊 Нет экспираций. Добавьте экспирацию (тикер + дата), затем нажмите «Рассчитать индикаторы»."
                 )
             else:
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text="📊 Нет пресетов GEX. Добавьте пресет, затем нажмите «Рассчитать GEX»."
+                    text="📊 Нет экспираций. Добавьте экспирацию, затем нажмите «Рассчитать индикаторы»."
                 )
             return CHOOSING_ACTION
         all_data = data_store.get_all()
@@ -596,14 +598,38 @@ class TelegramOptionBot:
                 if sym.startswith(f"{underlying}-{exp_str}-") and d.get("underlying_price"):
                     underlying_price = d["underlying_price"]
                     break
+            levels = self.db.get_support_resistance_levels(underlying)
             title = f"GEX {underlying} {exp_str}"
-            png_bytes = build_gex_chart_png(gex_by_strike, title=title, underlying_price=underlying_price)
+            png_bytes = build_gex_chart_png(
+                gex_by_strike,
+                title=title,
+                underlying_price=underlying_price,
+                support_resistance_levels=levels if (levels.get("support") or levels.get("resistance")) else None,
+            )
             await context.bot.send_photo(chat_id=chat_id, photo=png_bytes, caption=title)
             sent += 1
+            # IV (ATM) по часам за 8 часов из БД
+            iv_series, current_iv, iv_atm_only = self.db.get_iv_atm_hourly(underlying, exp_str, hours=8)
+            if iv_series:
+                iv_title = f"IV (ATM) {underlying} {exp_str}" if iv_atm_only else f"IV (все опционы) {underlying} {exp_str}"
+                iv_png = build_iv_chart_png(iv_series, title=iv_title, current_iv=current_iv)
+                await context.bot.send_photo(chat_id=chat_id, photo=iv_png, caption=iv_title + (f"  |  Текущее: {current_iv:.2%}" if current_iv is not None else ""))
+                sent += 1
+            # OI по часам за 8 часов из БД (снимок на границе часа); текущее OI — из текущей доски
+            oi_series = self.db.get_oi_hourly(underlying, exp_str, hours=8)
+            current_oi = sum(
+                (d.get("open_interest") or 0) for sym, d in all_data.items()
+                if sym.startswith(f"{underlying}-{exp_str}-")
+            )
+            if oi_series:
+                oi_title = f"OI {underlying} {exp_str}"
+                oi_png = build_oi_chart_png(oi_series, title=oi_title, current_oi=current_oi if current_oi else None)
+                await context.bot.send_photo(chat_id=chat_id, photo=oi_png, caption=oi_title + (f"  |  Текущее: {current_oi:,.0f}" if current_oi else ""))
+                sent += 1
         if query and sent == 0:
-            await query.edit_message_text("📊 По пресетам нет данных для расчёта GEX (нет опционов в доске с DTE ≤ 3).")
+            await query.edit_message_text("📊 По экспирациям нет данных для расчёта (нет опционов в доске с DTE ≤ 3).")
         elif query and sent > 0:
-            await query.edit_message_text(f"✅ Отправлено графиков GEX: {sent}")
+            await query.edit_message_text(f"✅ Отправлено графиков: {sent}")
         return CHOOSING_ACTION
 
     # ===== ДОБАВЛЕНИЕ ОПЦИОНА =====

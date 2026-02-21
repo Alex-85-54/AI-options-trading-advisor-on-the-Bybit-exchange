@@ -7,9 +7,10 @@ logs/*.log.*
 *.log
 monitoring_service.log
 trading_bot.log
-
+__pycache__/config.cpython-312.pyc
 # Python cache
 __pycache__/
+
 *.py[cod]
 *$py.class
 *.pyc
@@ -22,3 +23,5 @@ data/*.db
 
 .cursorrulles
 .coverage
+./.env
+.env

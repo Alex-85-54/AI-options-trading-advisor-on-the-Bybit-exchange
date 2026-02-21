@@ -133,6 +133,8 @@ CREATE TABLE option_history (
     delta REAL, gamma REAL, vega REAL, theta REAL,
     volume_24h REAL, open_interest REAL, underlying_price REAL,
     is_otm INTEGER NOT NULL DEFAULT 1,
+    option_type TEXT,
+    strike REAL,
     UNIQUE(symbol, date_data_collection)
 );
 

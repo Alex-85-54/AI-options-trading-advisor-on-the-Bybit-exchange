@@ -120,7 +120,9 @@ class OptionDataStore:
         
         save_only_otm = SUBSCRIPTION_CONFIG.get("save_only_otm", False)
         saved_count = 0
+        saved_atm_count = 0
         error_count = 0
+        logger.debug("Сохранение в БД: save_only_otm=%s (из config)", save_only_otm)
         
         try:
             for symbol, data in all_data.items():
@@ -171,13 +173,18 @@ class OptionDataStore:
                     
                     self._db.save_option_data(symbol, option_data, timestamp)
                     saved_count += 1
+                    if not otm:
+                        saved_atm_count += 1
                     
                 except Exception as e:
                     logger.error(f"Ошибка при сохранении данных опциона {symbol} в БД: {e}", exc_info=True)
                     error_count += 1
             
             if saved_count > 0:
-                logger.info(f"Сохранено {saved_count} опционов в БД" + (f", ошибок: {error_count}" if error_count > 0 else ""))
+                logger.info(
+                    f"Сохранено {saved_count} опционов в БД (ATM: {saved_atm_count}, OTM: {saved_count - saved_atm_count})"
+                    + (f", ошибок: {error_count}" if error_count > 0 else "")
+                )
             elif error_count > 0:
                 logger.warning(f"Не удалось сохранить данные в БД: {error_count} ошибок")
                 

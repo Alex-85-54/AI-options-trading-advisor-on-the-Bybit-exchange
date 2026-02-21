@@ -6,7 +6,7 @@ GEX = (open_interest_calls * gamma_calls) - (open_interest_puts * gamma_puts)
 """
 import io
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Sequence
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
@@ -168,10 +168,18 @@ def gex_summary_for_agent(gex_by_strike: Dict[float, float], top_n: int = 5) -> 
     }
 
 
+def _round_level_to_nearest_strike(price: float, strikes: List[float]) -> Optional[float]:
+    """Округлить значение уровня до ближайшего страйка. Возвращает None если strikes пустой."""
+    if not strikes:
+        return None
+    return min(strikes, key=lambda s: abs(s - price))
+
+
 def build_gex_chart_png(
     gex_by_strike: Dict[float, float],
     title: str = "GEX по страйкам",
-    underlying_price: Optional[float] = None
+    underlying_price: Optional[float] = None,
+    support_resistance_levels: Optional[Dict[str, List[float]]] = None
 ) -> bytes:
     """
     Построить столбчатую диаграмму GEX по страйкам, вернуть PNG в виде bytes.
@@ -180,6 +188,8 @@ def build_gex_chart_png(
         gex_by_strike: Словарь {strike: gex_value}
         title: Заголовок графика
         underlying_price: Цена базового актива (опционально — вертикальная линия на графике)
+        support_resistance_levels: Уровни из БД {'support': [prices], 'resistance': [prices]};
+            рисуются вертикальными линиями, округлёнными до ближайшего страйка.
     
     Returns:
         PNG изображение в байтах
@@ -199,21 +209,132 @@ def build_gex_chart_png(
         return buf.read()
 
     strikes = sorted(gex_by_strike.keys())
+    strike_to_idx = {s: i for i, s in enumerate(strikes)}
     values = [gex_by_strike[s] for s in strikes]
     colors = ['#2ecc71' if v >= 0 else '#e74c3c' for v in values]
 
     fig, ax = plt.subplots(figsize=(12, 6))
     bars = ax.bar(range(len(strikes)), values, color=colors, edgecolor='gray', linewidth=0.5)
     ax.axhline(y=0, color='black', linewidth=0.8)
+    legend_handles = []
     if underlying_price is not None and strikes:
-        # Позиция страйка, ближайшего к underlying_price
         idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying_price))
         ax.axvline(x=idx, color='blue', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
-        ax.legend(loc='upper right', fontsize=8)
+    if support_resistance_levels and strikes:
+        support_strikes = set()
+        for price in support_resistance_levels.get('support') or []:
+            s = _round_level_to_nearest_strike(price, strikes)
+            if s is not None:
+                support_strikes.add(s)
+        resistance_strikes = set()
+        for price in support_resistance_levels.get('resistance') or []:
+            s = _round_level_to_nearest_strike(price, strikes)
+            if s is not None:
+                resistance_strikes.add(s)
+        for s in support_strikes:
+            idx = strike_to_idx[s]
+            ax.axvline(x=idx, color='#27ae60', linestyle='-', linewidth=1.2, alpha=0.9)
+        for s in resistance_strikes:
+            idx = strike_to_idx[s]
+            ax.axvline(x=idx, color='#c0392b', linestyle='-', linewidth=1.2, alpha=0.9)
+        if support_strikes:
+            from matplotlib.lines import Line2D
+            legend_handles.append(Line2D([0], [0], color='#27ae60', linewidth=2, label='Поддержка'))
+        if resistance_strikes:
+            from matplotlib.lines import Line2D
+            legend_handles.append(Line2D([0], [0], color='#c0392b', linewidth=2, label='Сопротивление'))
+    if underlying_price is not None and strikes:
+        from matplotlib.lines import Line2D
+        legend_handles.insert(0, Line2D([0], [0], color='blue', linestyle='--', linewidth=2, label=f'Spot ~{underlying_price:,.0f}'))
+    if legend_handles:
+        ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
     ax.set_xticks(range(len(strikes)))
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('GEX')
     ax.set_title(title)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def build_iv_chart_png(
+    hourly_data: Sequence[Tuple[str, float]],
+    title: str = "IV (ATM)",
+    current_iv: Optional[float] = None
+) -> bytes:
+    """
+    График IV по часам (ATM опционы). Возвращает PNG в виде bytes.
+    
+    Args:
+        hourly_data: Список (hour_str, avg_iv)
+        title: Заголовок графика
+        current_iv: Текущее значение IV (выводится в подпись/заголовок)
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if not hourly_data:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, 'Нет данных IV за период', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    hours = [x[0] for x in hourly_data]
+    values = [x[1] for x in hourly_data]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(range(len(hours)), values, color='#3498db', marker='o', markersize=4, linewidth=1.5)
+    ax.set_xticks(range(len(hours)))
+    ax.set_xticklabels(hours, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('IV (ATM)')
+    ax.set_title(title + (f"  |  Текущее: {current_iv:.2%}" if current_iv is not None else ""))
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def build_oi_chart_png(
+    hourly_data: Sequence[Tuple[str, float]],
+    title: str = "Открытый интерес",
+    current_oi: Optional[float] = None
+) -> bytes:
+    """
+    График открытого интереса по часам (все опционы экспирации). Возвращает PNG в виде bytes.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    if not hourly_data:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, 'Нет данных OI за период', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    hours = [x[0] for x in hourly_data]
+    values = [x[1] for x in hourly_data]
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(range(len(hours)), values, color='#9b59b6', marker='s', markersize=4, linewidth=1.5)
+    ax.set_xticks(range(len(hours)))
+    ax.set_xticklabels(hours, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('Open Interest')
+    ax.set_title(title + (f"  |  Текущее: {current_oi:,.0f}" if current_oi is not None else ""))
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')

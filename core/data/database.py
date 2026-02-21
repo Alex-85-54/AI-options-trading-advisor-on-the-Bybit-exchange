@@ -32,6 +32,9 @@ class OptionDatabase:
        - delta, gamma, vega, theta: REAL - греки опциона
        - volume_24h, open_interest: REAL - объем и открытый интерес
        - underlying_price: REAL - цена базового актива
+       - is_otm: INTEGER - 1 = OTM, 0 = ITM (бинарный признак)
+       - option_type: TEXT - тип опциона ('C' Call, 'P' Put), парсится из symbol
+       - strike: REAL - страйк, парсится из symbol
        
        Индексы:
        - idx_option_history_symbol: по symbol
@@ -92,8 +95,6 @@ class OptionDatabase:
        - computed_at: DATETIME - время расчета
        
     Важные особенности:
-    - В БД сохраняются ТОЛЬКО OTM (Out of The Money) опционы
-    - ITM и ATM опционы не сохраняются
     - Данные округляются до 5-минутных интервалов при сохранении
     - days_to_expiration вычисляется автоматически при сохранении
     - Для анализа похожих опционов используется запрос по (underlying_ticker, days_to_expiration)
@@ -261,17 +262,26 @@ class OptionDatabase:
                     open_interest REAL,
                     underlying_price REAL,
                     is_otm INTEGER NOT NULL DEFAULT 1,
+                    option_type TEXT,
+                    strike REAL,
                     UNIQUE(symbol, date_data_collection)
                 )
             """)
             
-            # Миграция: добавить is_otm в существующие БД (для записей до внедрения GEX проставляем True)
+            # Миграция: добавить отсутствующие колонки в существующие БД (выполняется только один раз по каждой колонке).
+            # Для перерасчёта is_otm по логике Call/Put используйте скрипт scripts/fix_is_otm.py.
             cursor.execute("PRAGMA table_info(option_history)")
             columns = [row[1] for row in cursor.fetchall()]
             if 'is_otm' not in columns:
                 cursor.execute("ALTER TABLE option_history ADD COLUMN is_otm INTEGER NOT NULL DEFAULT 1")
                 cursor.execute("UPDATE option_history SET is_otm = 1 WHERE is_otm IS NULL")
                 logger.info("Миграция option_history: добавлена колонка is_otm, существующие записи помечены is_otm=1")
+            if 'option_type' not in columns:
+                cursor.execute("ALTER TABLE option_history ADD COLUMN option_type TEXT")
+                logger.info("Миграция option_history: добавлена колонка option_type")
+            if 'strike' not in columns:
+                cursor.execute("ALTER TABLE option_history ADD COLUMN strike REAL")
+                logger.info("Миграция option_history: добавлена колонка strike")
             
             # Индексы для option_history
             cursor.execute("""
@@ -481,7 +491,8 @@ class OptionDatabase:
                 - delta, gamma, vega, theta
                 - volume_24h, open_interest
                 - underlying_price
-                - is_otm: bool (True для OTM, False для ITM/ATM) — для фильтрации в не-GEX расчётах
+                - is_otm: bool (True для OTM, False для ITM) — для фильтрации в не-GEX расчётах
+            option_type и strike заполняются автоматически из symbol при сохранении.
             timestamp: Временная метка. Если None, используется текущее время.
                      Автоматически округляется до минут, кратных 5.
         """
@@ -501,6 +512,11 @@ class OptionDatabase:
         
         expiration_date = parsed['expiration_date']
         underlying_ticker = parsed['underlying']
+        option_type = (parsed.get('option_type') or '').upper() or None
+        try:
+            strike = float(parsed['strike']) if parsed.get('strike') is not None else None
+        except (TypeError, ValueError):
+            strike = None
         
         # Вычисляем days_to_expiration
         collection_date = date_data_collection_local.date()
@@ -520,8 +536,9 @@ class OptionDatabase:
                     ask_price, bid_price, mark_price,
                     iv, ask_iv, bid_iv, mark_iv,
                     delta, gamma, vega, theta,
-                    volume_24h, open_interest, underlying_price, is_otm
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    volume_24h, open_interest, underlying_price, is_otm,
+                    option_type, strike
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol,
                 date_data_collection_str,
@@ -542,7 +559,9 @@ class OptionDatabase:
                 option_data.get('volume_24h'),
                 option_data.get('open_interest'),
                 option_data.get('underlying_price'),
-                is_otm
+                is_otm,
+                option_type,
+                strike
             ))
             
             # Сохраняем IV в отдельную таблицу для быстрого доступа
@@ -1359,6 +1378,103 @@ class OptionDatabase:
         except sqlite3.Error as e:
             logger.error(f"Ошибка при получении истории опционов для порогов: {e}")
             raise
+        finally:
+            conn.close()
+
+    def get_iv_atm_hourly(
+        self,
+        underlying: str,
+        expiration_str: str,
+        hours: int = 8
+    ) -> Tuple[List[Tuple[str, float]], Optional[float], bool]:
+        """
+        IV по часам за последние hours часов (сначала ATM, при отсутствии данных — все опционы).
+        Только опционы с заданной экспирацией (underlying + expiration_str).
+        
+        Returns:
+            ([(hour_str, avg_iv), ...], current_iv или None, atm_only: True если использованы только ATM)
+        """
+        from core.data.option_board import parse_expiration_date
+        exp_date = parse_expiration_date(expiration_str.upper())
+        if not exp_date:
+            return [], None, True
+        since = datetime.now() - timedelta(hours=hours)
+        since_str = self._format_local_datetime(since)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # Сначала пробуем только ATM (is_otm = 0)
+            cursor.execute("""
+                SELECT strftime('%Y-%m-%d %H:00', date_data_collection) AS hour_ts,
+                       AVG(iv) AS avg_iv
+                FROM option_history
+                WHERE underlying_ticker = ? AND expiration_date = ? AND is_otm = 0
+                  AND iv IS NOT NULL AND date_data_collection >= ?
+                GROUP BY hour_ts
+                ORDER BY hour_ts ASC
+            """, (underlying.upper(), exp_date.isoformat(), since_str))
+            rows = cursor.fetchall()
+            if rows:
+                series = [(row["hour_ts"], float(row["avg_iv"])) for row in rows]
+                current_iv = float(rows[-1]["avg_iv"])
+                return series, current_iv, True
+            # Нет данных по ATM — берём все опционы экспирации (ATM+OTM)
+            cursor.execute("""
+                SELECT strftime('%Y-%m-%d %H:00', date_data_collection) AS hour_ts,
+                       AVG(iv) AS avg_iv
+                FROM option_history
+                WHERE underlying_ticker = ? AND expiration_date = ?
+                  AND iv IS NOT NULL AND date_data_collection >= ?
+                GROUP BY hour_ts
+                ORDER BY hour_ts ASC
+            """, (underlying.upper(), exp_date.isoformat(), since_str))
+            rows = cursor.fetchall()
+            series = [(row["hour_ts"], float(row["avg_iv"])) for row in rows]
+            current_iv = float(rows[-1]["avg_iv"]) if rows else None
+            return series, current_iv, False
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка get_iv_atm_hourly: {e}")
+            return [], None, True
+        finally:
+            conn.close()
+
+    def get_oi_hourly(
+        self,
+        underlying: str,
+        expiration_str: str,
+        hours: int = 8
+    ) -> List[Tuple[str, float]]:
+        """
+        Суммарный открытый интерес по всем опционам экспирации по часам за последние hours часов.
+        Берётся один снимок на границе часа (date_data_collection с минутами 00: 12:00, 13:00, ...),
+        по нему суммируется open_interest по доске на этот момент.
+        
+        Returns:
+            [(hour_str, total_oi), ...]
+        """
+        from core.data.option_board import parse_expiration_date
+        exp_date = parse_expiration_date(expiration_str.upper())
+        if not exp_date:
+            return []
+        since = datetime.now() - timedelta(hours=hours)
+        since_str = self._format_local_datetime(since)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT strftime('%Y-%m-%d %H:00', date_data_collection) AS hour_ts,
+                       SUM(open_interest) AS total_oi
+                FROM option_history
+                WHERE underlying_ticker = ? AND expiration_date = ? AND date_data_collection >= ?
+                  AND strftime('%M', date_data_collection) = '00'
+                GROUP BY hour_ts
+                ORDER BY hour_ts ASC
+            """, (underlying.upper(), exp_date.isoformat(), since_str))
+            rows = cursor.fetchall()
+            return [(row["hour_ts"], float(row["total_oi"] or 0)) for row in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка get_oi_hourly: {e}")
+            return []
         finally:
             conn.close()
 
