@@ -31,6 +31,7 @@ from core.strategy.gex_calculator import (
     build_gex_chart_png,
     build_iv_chart_png,
     build_oi_chart_png,
+    compute_iv_atm_from_board,
 )
 from utils.logging_config import setup_service_logging
 
@@ -608,10 +609,11 @@ class TelegramOptionBot:
             )
             await context.bot.send_photo(chat_id=chat_id, photo=png_bytes, caption=title)
             sent += 1
-            # IV (ATM) по часам за 8 часов из БД
-            iv_series, current_iv, iv_atm_only = self.db.get_iv_atm_hourly(underlying, exp_str, hours=8)
+            # IV (ATM) по часам из снимков на границе часа; текущее IV_ATM — из текущей доски
+            iv_series = self.db.get_iv_atm_hourly(underlying, exp_str, hours=8)
+            current_iv = compute_iv_atm_from_board(all_data, underlying, exp_str)
             if iv_series:
-                iv_title = f"IV (ATM) {underlying} {exp_str}" if iv_atm_only else f"IV (все опционы) {underlying} {exp_str}"
+                iv_title = f"IV (ATM) {underlying} {exp_str}"
                 iv_png = build_iv_chart_png(iv_series, title=iv_title, current_iv=current_iv)
                 await context.bot.send_photo(chat_id=chat_id, photo=iv_png, caption=iv_title + (f"  |  Текущее: {current_iv:.2%}" if current_iv is not None else ""))
                 sent += 1

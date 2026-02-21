@@ -1381,62 +1381,89 @@ class OptionDatabase:
         finally:
             conn.close()
 
+    def _iv_atm_from_snapshot_rows(self, rows: List[Dict]) -> Optional[float]:
+        """
+        По снимку доски (список строк с underlying_price, iv, option_type, strike)
+        вычислить IV_ATM = (IV_PUT_OTM + IV_CALL_OTM) / 2.
+        PUT OTM: ближайший страйк Put ниже underlying_price (max strike < price).
+        CALL OTM: ближайший страйк Call выше underlying_price (min strike > price).
+        """
+        if not rows:
+            return None
+        underlying_price = rows[0].get("underlying_price")
+        if underlying_price is None:
+            return None
+        try:
+            underlying_price = float(underlying_price)
+        except (TypeError, ValueError):
+            return None
+        put_rows = [r for r in rows if (r.get("option_type") or "").upper() == "P" and r.get("iv") is not None]
+        call_rows = [r for r in rows if (r.get("option_type") or "").upper() == "C" and r.get("iv") is not None]
+        put_otm = [r for r in put_rows if r.get("strike") is not None and float(r["strike"]) < underlying_price]
+        call_otm = [r for r in call_rows if r.get("strike") is not None and float(r["strike"]) > underlying_price]
+        if not put_otm or not call_otm:
+            return None
+        put_row = max(put_otm, key=lambda r: float(r["strike"]))
+        call_row = min(call_otm, key=lambda r: float(r["strike"]))
+        iv_put = float(put_row["iv"])
+        iv_call = float(call_row["iv"])
+        return (iv_put + iv_call) / 2.0
+
     def get_iv_atm_hourly(
         self,
         underlying: str,
         expiration_str: str,
         hours: int = 8
-    ) -> Tuple[List[Tuple[str, float]], Optional[float], bool]:
+    ) -> List[Tuple[str, float]]:
         """
-        IV по часам за последние hours часов (сначала ATM, при отсутствии данных — все опционы).
-        Только опционы с заданной экспирацией (underlying + expiration_str).
+        IV_ATM по часам за последние hours часов. Снимок на границе часа (12:00, 13:00, ...).
+        IV_ATM = (IV_PUT_OTM + IV_CALL_OTM) / 2: PUT OTM — ближайший страйк Put < underlying_price,
+        CALL OTM — ближайший страйк Call > underlying_price.
         
         Returns:
-            ([(hour_str, avg_iv), ...], current_iv или None, atm_only: True если использованы только ATM)
+            [(hour_str, iv_atm), ...]
         """
         from core.data.option_board import parse_expiration_date
         exp_date = parse_expiration_date(expiration_str.upper())
         if not exp_date:
-            return [], None, True
+            return []
         since = datetime.now() - timedelta(hours=hours)
         since_str = self._format_local_datetime(since)
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
-            # Сначала пробуем только ATM (is_otm = 0)
             cursor.execute("""
-                SELECT strftime('%Y-%m-%d %H:00', date_data_collection) AS hour_ts,
-                       AVG(iv) AS avg_iv
+                SELECT date_data_collection, underlying_price, iv, option_type, strike
                 FROM option_history
-                WHERE underlying_ticker = ? AND expiration_date = ? AND is_otm = 0
-                  AND iv IS NOT NULL AND date_data_collection >= ?
-                GROUP BY hour_ts
-                ORDER BY hour_ts ASC
+                WHERE underlying_ticker = ? AND expiration_date = ? AND date_data_collection >= ?
+                  AND strftime('%M', date_data_collection) = '00'
+                  AND iv IS NOT NULL
+                ORDER BY date_data_collection ASC, strike ASC
             """, (underlying.upper(), exp_date.isoformat(), since_str))
-            rows = cursor.fetchall()
-            if rows:
-                series = [(row["hour_ts"], float(row["avg_iv"])) for row in rows]
-                current_iv = float(rows[-1]["avg_iv"])
-                return series, current_iv, True
-            # Нет данных по ATM — берём все опционы экспирации (ATM+OTM)
-            cursor.execute("""
-                SELECT strftime('%Y-%m-%d %H:00', date_data_collection) AS hour_ts,
-                       AVG(iv) AS avg_iv
-                FROM option_history
-                WHERE underlying_ticker = ? AND expiration_date = ?
-                  AND iv IS NOT NULL AND date_data_collection >= ?
-                GROUP BY hour_ts
-                ORDER BY hour_ts ASC
-            """, (underlying.upper(), exp_date.isoformat(), since_str))
-            rows = cursor.fetchall()
-            series = [(row["hour_ts"], float(row["avg_iv"])) for row in rows]
-            current_iv = float(rows[-1]["avg_iv"]) if rows else None
-            return series, current_iv, False
+            rows = [dict(r) for r in cursor.fetchall()]
         except sqlite3.Error as e:
             logger.error(f"Ошибка get_iv_atm_hourly: {e}")
-            return [], None, True
+            return []
         finally:
             conn.close()
+        # Группировка по часу
+        from collections import defaultdict
+        by_hour: Dict[str, List[Dict]] = defaultdict(list)
+        for r in rows:
+            dt = r.get("date_data_collection")
+            if not dt:
+                continue
+            if isinstance(dt, str):
+                hour_ts = dt[:16] if len(dt) >= 16 else dt  # YYYY-MM-DD HH:00
+            else:
+                hour_ts = dt.strftime("%Y-%m-%d %H:00") if hasattr(dt, "strftime") else str(dt)
+            by_hour[hour_ts].append(r)
+        result = []
+        for hour_ts in sorted(by_hour.keys()):
+            iv_atm = self._iv_atm_from_snapshot_rows(by_hour[hour_ts])
+            if iv_atm is not None:
+                result.append((hour_ts, iv_atm))
+        return result
 
     def get_oi_hourly(
         self,

@@ -252,12 +252,57 @@ def build_gex_chart_png(
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('GEX')
     ax.set_title(title)
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+def compute_iv_atm_from_board(
+    data_by_symbol: Dict[str, Dict],
+    underlying: str,
+    expiration_str: str
+) -> Optional[float]:
+    """
+    IV_ATM по текущей доске: (IV_PUT_OTM + IV_CALL_OTM) / 2.
+    PUT OTM — ближайший страйк Put < underlying_price (max strike).
+    CALL OTM — ближайший страйк Call > underlying_price (min strike).
+    data_by_symbol: словарь из data_store.get_all() (symbol -> data с iv, underlying_price).
+    """
+    prefix = f"{underlying.upper()}-{expiration_str.upper()}-"
+    rows = []
+    underlying_price = None
+    for symbol, data in data_by_symbol.items():
+        if not symbol.startswith(prefix):
+            continue
+        if underlying_price is None:
+            underlying_price = data.get("underlying_price")
+        strike = _parse_symbol(symbol)[2]
+        opt_type = _option_type_from_symbol(symbol)
+        iv = data.get("iv") or data.get("mark_iv") or data.get("ask_iv") or data.get("bid_iv")
+        if strike is not None and opt_type and iv is not None:
+            rows.append({
+                "strike": strike,
+                "option_type": opt_type,
+                "iv": float(iv),
+                "underlying_price": data.get("underlying_price"),
+            })
+    if not rows or underlying_price is None:
+        return None
+    try:
+        underlying_price = float(underlying_price)
+    except (TypeError, ValueError):
+        return None
+    put_otm = [r for r in rows if r["option_type"] == "P" and r["strike"] < underlying_price]
+    call_otm = [r for r in rows if r["option_type"] == "C" and r["strike"] > underlying_price]
+    if not put_otm or not call_otm:
+        return None
+    put_row = max(put_otm, key=lambda r: r["strike"])
+    call_row = min(call_otm, key=lambda r: r["strike"])
+    return (put_row["iv"] + call_row["iv"]) / 2.0
 
 
 def build_iv_chart_png(
