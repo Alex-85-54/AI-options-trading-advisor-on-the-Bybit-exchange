@@ -16,7 +16,6 @@ Bot_Option_cursor/├── core/                          # Основные м
 Таблицы:
 option_history (symbol, timestamp, price, iv, delta, gamma, vega, theta, volume, oi)
 underlying_history (symbol, timestamp, price)
-iv_history (symbol, timestamp, iv, ivr)
 Методы: save_option_data(), get_historical_greeks(), get_iv_statistics()
 Шаг 1.2: Расширение data_store
 Интеграция с SQLite: периодическое сохранение данных из WebSocket в БД
@@ -158,6 +157,17 @@ CREATE TABLE gex_presets (
     UNIQUE(user_id, underlying, expiration_str)
 );
 ```
+
+-- Настройки мониторинга GEX по пользователю (порог и частота проверки)
+```sql
+CREATE TABLE gex_monitor_settings (
+    user_id INTEGER PRIMARY KEY,
+    threshold REAL,
+    interval_minutes INTEGER,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+Методы: `get_gex_monitor_settings(user_id)`, `set_gex_monitor_threshold(user_id, value)`, `set_gex_monitor_interval(user_id, interval_minutes)`.
 
 -- История базовых активов
 ```sql

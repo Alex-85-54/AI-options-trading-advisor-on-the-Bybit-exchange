@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from config import DYNAMIC_THRESHOLD_CONFIG, DTE_BINS, STRATEGY_CONFIG
+from config import DISPLAY_TIMEZONE, DYNAMIC_THRESHOLD_CONFIG, DTE_BINS, STRATEGY_CONFIG, format_datetime_local
 from core.data.database import get_database
 
 logger = logging.getLogger(__name__)
@@ -221,15 +221,11 @@ class DynamicThresholds:
             return {"dte_bucket": dte_bucket, "missing_data": 0}
         slices: Dict[str, List[Dict]] = defaultdict(list)
         volume_values: List[float] = []
-        iv_values: List[float] = []
         for row in rows:
             slices[row["date_data_collection"]].append(row)
             volume = row.get("volume_24h")
             if volume is not None:
                 volume_values.append(volume)
-            iv = row.get("iv")
-            if iv is not None:
-                iv_values.append(iv)
         imbalance_values: List[float] = []
         skew_values: List[float] = []
         gamma_conc_values: List[float] = []
@@ -244,23 +240,39 @@ class DynamicThresholds:
                 gamma_conc_values.append(metrics["gamma_concentration"])
             if metrics["vega_concentration"] is not None:
                 vega_conc_values.append(metrics["vega_concentration"])
+        # ivr_threshold считаем только по IV_ATM (методика из gex_calculator: Put OTM + Call OTM / 2)
+        slices_iv_atm: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
+        for row in rows:
+            key = (row["date_data_collection"], row.get("expiration_date"))
+            if key[1] is None:
+                continue
+            slices_iv_atm[key].append(row)
+        iv_atm_pairs: List[Tuple[str, float]] = []
+        for (dt, _exp), slice_rows in slices_iv_atm.items():
+            iv_atm = self.db._iv_atm_from_snapshot_rows(slice_rows)
+            if iv_atm is not None:
+                iv_atm_pairs.append((dt, iv_atm))
+        if dte_bucket in ("0-1", "2-3"):
+            cutoff = datetime.now(DISPLAY_TIMEZONE) - timedelta(days=7)
+            cutoff_str = format_datetime_local(cutoff, "%Y-%m-%d %H:%M:%S")
+            iv_atm_pairs = [(dt, v) for dt, v in iv_atm_pairs if dt >= cutoff_str]
+        iv_atm_values = [v for _dt, v in iv_atm_pairs]
+        ivr_values: List[float] = []
+        if len(iv_atm_values) >= 2:
+            min_iv = min(iv_atm_values)
+            max_iv = max(iv_atm_values)
+            iv_range = max_iv - min_iv
+            if iv_range > 0:
+                ivr_values = [max(0.0, min(100.0, ((x - min_iv) / iv_range) * 100.0)) for x in iv_atm_values]
         percentile_map = self.percentiles
         calculations = {
-            "ivr_threshold": ([], percentile_map.get("ivr_threshold", 85)),
+            "ivr_threshold": (ivr_values, percentile_map.get("ivr_threshold", 85)),
             "delta_imbalance_threshold": (imbalance_values, percentile_map.get("delta_imbalance", 85)),
             "skew_threshold": (skew_values, percentile_map.get("skew", 85)),
             "gamma_concentration_threshold": (gamma_conc_values, percentile_map.get("gamma_concentration", 85)),
             "vega_concentration_threshold": (vega_conc_values, percentile_map.get("vega_concentration", 85)),
             "volume_spike_threshold": (volume_values, percentile_map.get("volume_spike", 95)),
         }
-        ivr_values: List[float] = []
-        if iv_values:
-            min_iv = min(iv_values)
-            max_iv = max(iv_values)
-            iv_range = max_iv - min_iv
-            if iv_range > 0:
-                ivr_values = [max(0.0, min(100.0, ((iv - min_iv) / iv_range) * 100.0)) for iv in iv_values]
-        calculations["ivr_threshold"] = (ivr_values, percentile_map.get("ivr_threshold", 85))
         insufficient = {}
         for metric, (values, pct) in calculations.items():
             if pct is None:

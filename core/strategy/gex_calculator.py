@@ -12,7 +12,7 @@ from collections import defaultdict
 logger = logging.getLogger(__name__)
 
 # Максимальный DTE для учёта в GEX (дневные опционы)
-GEX_MAX_DTE = 3
+GEX_MAX_DTE = 5
 
 
 def _parse_symbol(symbol: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
@@ -88,6 +88,67 @@ def calculate_gex_by_strike(
 def total_gex(gex_by_strike: Dict[float, float]) -> float:
     """Суммарный GEX по всем страйкам."""
     return sum(gex_by_strike.values())
+
+
+def max_abs_gex(gex_by_strike: Dict[float, float]) -> Tuple[float, Optional[float]]:
+    """
+    Максимальное отклонение GEX от нуля по модулю по всем страйкам.
+    Returns:
+        (max_abs_value, strike_at_max) — модуль и страйк, на котором достигнут максимум.
+        При пустом словаре — (0.0, None).
+    """
+    if not gex_by_strike:
+        return (0.0, None)
+    best_strike = max(gex_by_strike.keys(), key=lambda s: abs(gex_by_strike[s]))
+    return (abs(gex_by_strike[best_strike]), best_strike)
+
+
+def gex_zone_and_flip(
+    gex_by_strike: Dict[float, float],
+    spot: float,
+    near_flip_pct: float = 0.02,
+    strong_positive_ratio: float = 0.3
+) -> Tuple[bool, bool]:
+    """
+    Оценка зоны GEX относительно спота для чек-листа входа.
+    Returns:
+        (in_negative_zone_or_near_flip, strong_positive_around_spot)
+        - True, False: благоприятно для волатильности (цена в -GEX или у flip, нет сильного +GEX)
+        - False, True: неблагоприятно (сильный +GEX вокруг спота)
+    """
+    if not gex_by_strike or spot <= 0:
+        return (False, False)
+    strikes = sorted(gex_by_strike.keys())
+    # Gamma flip: уровень, где кумулятивный GEX переходит из - в + (снизу вверх по страйкам)
+    cum = 0.0
+    flip_strike: Optional[float] = None
+    for s in strikes:
+        prev = cum
+        cum += gex_by_strike[s]
+        if prev < 0 and cum >= 0:
+            flip_strike = s
+            break
+    # Благоприятно: спот в зоне -GEX (ниже flip) или рядом с flip
+    in_negative_or_near_flip = False
+    if flip_strike is not None:
+        if spot <= flip_strike:
+            in_negative_or_near_flip = True
+        elif flip_strike > 0 and spot <= flip_strike * (1 + near_flip_pct):
+            in_negative_or_near_flip = True
+    else:
+        # Flip не найден: кумулятив нигде не перешёл из - в +. Если в точке спота кумулятив < 0 — мы в зоне -GEX.
+        cum_at_spot = sum(gex_by_strike[s] for s in strikes if s <= spot)
+        if cum_at_spot < 0:
+            in_negative_or_near_flip = True
+    # Сильный +GEX вокруг спота: GEX в страйках рядом с спотом существенно положительный
+    strong_positive = False
+    if strikes:
+        nearest_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+        gex_at_spot = gex_by_strike[strikes[nearest_idx]]
+        max_gex = max(gex_by_strike.values()) if gex_by_strike else 0
+        if max_gex > 0 and gex_at_spot >= strong_positive_ratio * max_gex:
+            strong_positive = True
+    return (in_negative_or_near_flip, strong_positive)
 
 
 def options_from_datastore_for_gex(
@@ -175,6 +236,26 @@ def _round_level_to_nearest_strike(price: float, strikes: List[float]) -> Option
     return min(strikes, key=lambda s: abs(s - price))
 
 
+def _strikes_centered_on_spot(
+    strikes: List[float],
+    underlying_price: Optional[float],
+    max_strikes: int = 31
+) -> List[float]:
+    """
+    Вернуть подсписок страйков так, чтобы ближайший к underlying_price страйк был в центре гистограммы.
+    Если underlying_price None или strikes пустой — возвращаем все страйки без изменений.
+    """
+    if not strikes or underlying_price is None:
+        return strikes
+    nearest_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying_price))
+    half = max_strikes // 2
+    start = max(0, nearest_idx - half)
+    end = min(len(strikes), start + max_strikes)
+    if end - start < max_strikes and start > 0:
+        start = max(0, end - max_strikes)
+    return strikes[start:end]
+
+
 def build_gex_chart_png(
     gex_by_strike: Dict[float, float],
     title: str = "GEX по страйкам",
@@ -209,6 +290,7 @@ def build_gex_chart_png(
         return buf.read()
 
     strikes = sorted(gex_by_strike.keys())
+    strikes = _strikes_centered_on_spot(strikes, underlying_price)
     strike_to_idx = {s: i for i, s in enumerate(strikes)}
     values = [gex_by_strike[s] for s in strikes]
     colors = ['#2ecc71' if v >= 0 else '#e74c3c' for v in values]
@@ -252,6 +334,79 @@ def build_gex_chart_png(
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('GEX')
     ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def build_oi_by_strike_chart_png(
+    data_by_symbol: Dict[str, Dict],
+    underlying: str,
+    expiration_str: str,
+    underlying_price: Optional[float] = None
+) -> Optional[bytes]:
+    """
+    Гистограмма OI по страйкам: суммарный Open Interest для каждого страйка.
+    Calls и Puts на одной диаграмме (группированные столбцы). Данные из доски (data_store).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    prefix = f"{underlying.upper()}-{expiration_str.upper()}-"
+    oi_call: Dict[float, float] = defaultdict(float)
+    oi_put: Dict[float, float] = defaultdict(float)
+    for symbol, data in data_by_symbol.items():
+        if not symbol.startswith(prefix):
+            continue
+        strike = _parse_symbol(symbol)[2]
+        if strike is None:
+            continue
+        oi = data.get("open_interest")
+        if oi is not None:
+            try:
+                oi = float(oi)
+            except (TypeError, ValueError):
+                continue
+        else:
+            continue
+        if _is_call_symbol(symbol, data):
+            oi_call[strike] += oi
+        else:
+            oi_put[strike] += oi
+
+    strikes = sorted(set(oi_call.keys()) | set(oi_put.keys()))
+    strikes = _strikes_centered_on_spot(strikes, underlying_price)
+    if not strikes:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, 'Нет данных для OI по страйкам', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    oi_calls = [oi_call.get(s, 0) for s in strikes]
+    oi_puts = [oi_put.get(s, 0) for s in strikes]
+    x = range(len(strikes))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.bar([i - width / 2 for i in x], oi_calls, width, label='Calls', color='#3498db', edgecolor='gray', linewidth=0.5)
+    ax.bar([i + width / 2 for i in x], oi_puts, width, label='Puts', color='#e74c3c', edgecolor='gray', linewidth=0.5)
+    if underlying_price is not None and strikes:
+        idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying_price))
+        ax.axvline(x=idx, color='gray', linestyle='--', linewidth=1.2, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('Open Interest')
+    ax.set_title(f"OI по страйкам {underlying} {expiration_str}")
+    ax.legend(loc='upper right', fontsize=9)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO()
@@ -305,6 +460,23 @@ def compute_iv_atm_from_board(
     return (put_row["iv"] + call_row["iv"]) / 2.0
 
 
+def _shorten_hour_label(hour_str: str) -> str:
+    """Сократить метку времени для оси X: 'YYYY-MM-DD HH:00' -> 'DD.MM HH:00' (без года)."""
+    if not hour_str or len(hour_str) < 16:
+        return hour_str
+    try:
+        # "2026-02-28 12:00" -> "28.02 12:00"
+        parts = hour_str.strip().split()
+        if len(parts) >= 2:
+            date_part = parts[0]  # YYYY-MM-DD
+            time_part = parts[1][:5] if len(parts[1]) >= 5 else parts[1]  # HH:00
+            y, m, d = date_part.split("-")
+            return f"{int(d):02d}.{int(m):02d} {time_part}"
+    except (ValueError, IndexError):
+        pass
+    return hour_str
+
+
 def build_iv_chart_png(
     hourly_data: Sequence[Tuple[str, float]],
     title: str = "IV (ATM)",
@@ -334,10 +506,11 @@ def build_iv_chart_png(
 
     hours = [x[0] for x in hourly_data]
     values = [x[1] for x in hourly_data]
+    hour_labels = [_shorten_hour_label(h) for h in hours]
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(range(len(hours)), values, color='#3498db', marker='o', markersize=4, linewidth=1.5)
     ax.set_xticks(range(len(hours)))
-    ax.set_xticklabels(hours, rotation=45, ha='right', fontsize=8)
+    ax.set_xticklabels(hour_labels, rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('IV (ATM)')
     ax.set_title(title + (f"  |  Текущее: {current_iv:.2%}" if current_iv is not None else ""))
     ax.grid(True, alpha=0.3)
@@ -373,16 +546,274 @@ def build_oi_chart_png(
 
     hours = [x[0] for x in hourly_data]
     values = [x[1] for x in hourly_data]
+    hour_labels = [_shorten_hour_label(h) for h in hours]
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(range(len(hours)), values, color='#9b59b6', marker='s', markersize=4, linewidth=1.5)
     ax.set_xticks(range(len(hours)))
-    ax.set_xticklabels(hours, rotation=45, ha='right', fontsize=8)
+    ax.set_xticklabels(hour_labels, rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('Open Interest')
     ax.set_title(title + (f"  |  Текущее: {current_oi:,.0f}" if current_oi is not None else ""))
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _smile_from_snapshot_rows(rows: List[Dict]) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    """Построить (calls, puts) для улыбки из снимка БД: rows с ключами strike, option_type, iv."""
+    calls: List[Tuple[float, float]] = []
+    puts: List[Tuple[float, float]] = []
+    for r in rows:
+        strike = r.get("strike")
+        iv = r.get("iv")
+        opt = (r.get("option_type") or "").upper()
+        if strike is None or iv is None:
+            continue
+        try:
+            s, v = float(strike), float(iv)
+        except (TypeError, ValueError):
+            continue
+        if opt in ("C", "CALL"):
+            calls.append((s, v))
+        elif opt in ("P", "PUT"):
+            puts.append((s, v))
+    return (calls, puts)
+
+
+def _is_call_symbol(symbol: str, data: Optional[Dict] = None) -> bool:
+    """Определить, является ли опцион Call по символу или по data.option_type."""
+    if data is not None:
+        ot = (data.get("option_type") or "").upper()
+        if ot in ("C", "CALL"):
+            return True
+        if ot in ("P", "PUT"):
+            return False
+    opt = _option_type_from_symbol(symbol)
+    if opt == "C":
+        return True
+    if opt == "P":
+        return False
+    # Fallback: по конвенции Bybit в символе тип перед последней частью: ...-C-USDT или ...-P-USDT
+    parts = symbol.split("-")
+    if len(parts) >= 4:
+        return (parts[3] or "").upper() == "C"
+    return False
+
+
+def build_volatility_smile_chart_png(
+    data_by_symbol: Dict[str, Dict],
+    underlying: str,
+    expiration_str: str
+) -> Optional[bytes]:
+    """
+    Точечный график «Улыбка волатильности»: X — страйки, Y — IV.
+    Отдельные точки и линии для Calls и Puts. Вертикальная линия — underlying_price (округлён до ближайшего страйка).
+    В шапке: высота улыбки (max(iv) - min(iv)) для Calls и Puts.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    prefix = f"{underlying.upper()}-{expiration_str.upper()}-"
+    # Поддержка варианта, когда underlying пришёл в другом регистре/раскладке
+    prefix_alt = f"{underlying}-{expiration_str}-" if underlying != underlying.upper() or expiration_str != expiration_str.upper() else None
+    calls = []  # (strike, iv)
+    puts = []   # (strike, iv)
+    underlying_price = None
+    for symbol, data in data_by_symbol.items():
+        if not symbol.startswith(prefix) and (not prefix_alt or not symbol.startswith(prefix_alt)):
+            continue
+        strike = _parse_symbol(symbol)[2]
+        iv = data.get("iv") or data.get("mark_iv") or data.get("ask_iv") or data.get("bid_iv")
+        if underlying_price is None and data.get("underlying_price"):
+            try:
+                underlying_price = float(data["underlying_price"])
+            except (TypeError, ValueError):
+                pass
+        if strike is None or iv is None:
+            continue
+        try:
+            iv = float(iv)
+        except (TypeError, ValueError):
+            continue
+        if _is_call_symbol(symbol, data):
+            calls.append((strike, iv))
+        else:
+            puts.append((strike, iv))
+
+    if not calls and not puts:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, 'Нет данных для улыбки волатильности', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    all_strikes_list = sorted(set(s for s, _ in calls) | set(s for s, _ in puts))
+    strike_window = set(_strikes_centered_on_spot(all_strikes_list, underlying_price))
+    calls = [(s, v) for s, v in calls if s in strike_window]
+    puts = [(s, v) for s, v in puts if s in strike_window]
+
+    height_calls = (max(iv for _, iv in calls) - min(iv for _, iv in calls)) if calls else 0.0
+    height_puts = (max(iv for _, iv in puts) - min(iv for _, iv in puts)) if puts else 0.0
+    title = f"Улыбка волатильности {underlying} {expiration_str} | Высота улыбки: Calls {height_calls:.2%}, Puts {height_puts:.2%}"
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    color_calls = "#3498db"
+    color_puts = "#e74c3c"
+    if calls:
+        calls_sorted = sorted(calls, key=lambda x: x[0])
+        strikes_c, ivs_c = zip(*calls_sorted)
+        ax.plot(strikes_c, ivs_c, color=color_calls, linewidth=1, alpha=0.9)
+        ax.scatter(strikes_c, ivs_c, color=color_calls, label="Calls", alpha=0.8, s=30)
+    if puts:
+        puts_sorted = sorted(puts, key=lambda x: x[0])
+        strikes_p, ivs_p = zip(*puts_sorted)
+        ax.plot(strikes_p, ivs_p, color=color_puts, linewidth=1, alpha=0.9)
+        ax.scatter(strikes_p, ivs_p, color=color_puts, label="Puts", alpha=0.8, s=30)
+
+    all_strikes = [s for s, _ in calls] + [s for s, _ in puts]
+    if underlying_price is not None and all_strikes:
+        nearest_strike = min(all_strikes, key=lambda s: abs(s - underlying_price))
+        ax.axvline(x=nearest_strike, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
+
+    ax.set_xlabel("Страйк")
+    ax.set_ylabel("IV")
+    ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def build_volatility_smile_chart_png_three_series(
+    data_by_symbol: Dict[str, Dict],
+    underlying: str,
+    expiration_str: str,
+    snapshot_2h_ago: Optional[List[Dict]] = None,
+    snapshot_yesterday: Optional[List[Dict]] = None,
+    label_2h: str = "2 ч назад",
+    label_yesterday: str = "Вчера 20:00",
+) -> Optional[bytes]:
+    """
+    График «Улыбка волатильности» с тремя сериями: текущая, 2 ч назад, вчера 20:00.
+    Серии разными цветами, в легенде подписи.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    prefix = f"{underlying.upper()}-{expiration_str.upper()}-"
+    prefix_alt = f"{underlying}-{expiration_str}-" if (underlying != underlying.upper() or expiration_str != expiration_str.upper()) else None
+    calls_cur, puts_cur = [], []
+    underlying_price = None
+    for symbol, data in data_by_symbol.items():
+        if not symbol.startswith(prefix) and (not prefix_alt or not symbol.startswith(prefix_alt)):
+            continue
+        strike = _parse_symbol(symbol)[2]
+        iv = data.get("iv") or data.get("mark_iv") or data.get("ask_iv") or data.get("bid_iv")
+        if underlying_price is None and data.get("underlying_price"):
+            try:
+                underlying_price = float(data["underlying_price"])
+            except (TypeError, ValueError):
+                pass
+        if strike is None or iv is None:
+            continue
+        try:
+            iv = float(iv)
+        except (TypeError, ValueError):
+            continue
+        if _is_call_symbol(symbol, data):
+            calls_cur.append((strike, iv))
+        else:
+            puts_cur.append((strike, iv))
+
+    calls_2h, puts_2h = _smile_from_snapshot_rows(snapshot_2h_ago) if snapshot_2h_ago else ([], [])
+    calls_yest, puts_yest = _smile_from_snapshot_rows(snapshot_yesterday) if snapshot_yesterday else ([], [])
+
+    all_strikes_set = set()
+    for c, p in [(calls_cur, puts_cur), (calls_2h, puts_2h), (calls_yest, puts_yest)]:
+        for s, _ in c:
+            all_strikes_set.add(s)
+        for s, _ in p:
+            all_strikes_set.add(s)
+    all_strikes_list = sorted(all_strikes_set)
+    if not all_strikes_list:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, 'Нет данных для улыбки волатильности', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    strike_window = set(_strikes_centered_on_spot(all_strikes_list, underlying_price))
+
+    def filter_series(calls: List[Tuple[float, float]], puts: List[Tuple[float, float]]):
+        return (
+            [(s, v) for s, v in calls if s in strike_window],
+            [(s, v) for s, v in puts if s in strike_window],
+        )
+
+    calls_cur, puts_cur = filter_series(calls_cur, puts_cur)
+    calls_2h, puts_2h = filter_series(calls_2h, puts_2h)
+    calls_yest, puts_yest = filter_series(calls_yest, puts_yest)
+
+    if not calls_cur and not puts_cur:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(0.5, 0.5, 'Нет данных для улыбки волатильности', ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+
+    height_c = (max(iv for _, iv in calls_cur) - min(iv for _, iv in calls_cur)) if calls_cur else 0.0
+    height_p = (max(iv for _, iv in puts_cur) - min(iv for _, iv in puts_cur)) if puts_cur else 0.0
+    title = f"Улыбка волатильности {underlying} {expiration_str} | Высота: C {height_c:.2%}, P {height_p:.2%}"
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    series = [
+        (calls_cur, puts_cur, "Текущая", "#3498db", "#e74c3c"),
+        (calls_2h, puts_2h, label_2h, "#27ae60", "#e67e22"),
+        (calls_yest, puts_yest, label_yesterday, "#9b59b6", "#1abc9c"),
+    ]
+    for calls, puts, label, color_c, color_p in series:
+        if calls:
+            cs = sorted(calls, key=lambda x: x[0])
+            strikes_c, ivs_c = zip(*cs)
+            ax.plot(strikes_c, ivs_c, color=color_c, linewidth=1.2, alpha=0.9)
+            ax.scatter(strikes_c, ivs_c, color=color_c, label=f"{label} Calls", alpha=0.8, s=24)
+        if puts:
+            ps = sorted(puts, key=lambda x: x[0])
+            strikes_p, ivs_p = zip(*ps)
+            ax.plot(strikes_p, ivs_p, color=color_p, linewidth=1.2, alpha=0.9)
+            ax.scatter(strikes_p, ivs_p, color=color_p, label=f"{label} Puts", alpha=0.8, s=24)
+
+    if underlying_price is not None and strike_window:
+        nearest = min(strike_window, key=lambda s: abs(s - underlying_price))
+        ax.axvline(x=nearest, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
+
+    ax.set_xlabel("Страйк")
+    ax.set_ylabel("IV")
+    ax.set_title(title)
+    ax.legend(loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.read()

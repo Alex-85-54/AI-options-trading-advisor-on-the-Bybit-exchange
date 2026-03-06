@@ -48,22 +48,15 @@ class OptionDatabase:
        - symbol: TEXT - символ базового актива ('BTC', 'ETH')
        - timestamp: DATETIME - временная метка
        - price: REAL - цена актива
-       
-    3. iv_history - история IV (для быстрого доступа)
-       Поля:
-       - symbol: TEXT - символ опциона
-       - timestamp: DATETIME - временная метка
-       - iv: REAL - implied volatility
-       - ivr: REAL - IV Rank (может быть вычислен позже)
     
-    4. support_resistance_levels - уровни поддержки/сопротивления от пользователя
+    3. support_resistance_levels - уровни поддержки/сопротивления от пользователя
        Поля:
        - underlying: TEXT - базовый актив
        - level_type: TEXT - 'support' или 'resistance'
        - price: REAL - цена уровня
        - created_at: DATETIME - дата создания
        
-    5. agent_signals - история сигналов от агента
+    4. agent_signals - история сигналов от агента
        Поля:
        - signal_type: TEXT - тип сигнала ('strangle', 'straddle', 'call', 'put')
        - underlying: TEXT - базовый актив
@@ -75,7 +68,7 @@ class OptionDatabase:
        - created_at: DATETIME - дата создания
        - agent_version: TEXT - версия агента
        
-    6. signal_results - результаты сигналов (для анализа эффективности)
+    5. signal_results - результаты сигналов (для анализа эффективности)
        Поля:
        - signal_id: INTEGER - ID сигнала (FK к agent_signals)
        - entry_price, exit_price: REAL - цены входа/выхода
@@ -84,7 +77,7 @@ class OptionDatabase:
        - status: TEXT - 'pending', 'entered', 'closed', 'expired'
        - notes: TEXT
 
-    7. strategy_thresholds - динамические пороги стратегии
+    6. strategy_thresholds - динамические пороги стратегии
        Поля:
        - underlying: TEXT - базовый актив
        - dte_bucket: TEXT - бин days_to_expiration (например, '0-1', '2-3', '31-60')
@@ -324,6 +317,16 @@ class OptionDatabase:
                 CREATE INDEX IF NOT EXISTS idx_gex_presets_user_id 
                 ON gex_presets(user_id)
             """)
+
+            # Настройки мониторинга GEX по пользователю (порог и частота проверки)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS gex_monitor_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    threshold REAL,
+                    interval_minutes INTEGER,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             
             # Таблица истории базовых активов
             cursor.execute("""
@@ -344,28 +347,6 @@ class OptionDatabase:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_underlying_history_timestamp 
                 ON underlying_history(timestamp)
-            """)
-            
-            # Таблица истории IV (может быть вычислена из option_history, но для быстрого доступа)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS iv_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    timestamp DATETIME NOT NULL,
-                    iv REAL NOT NULL,
-                    ivr REAL,  -- IV Rank (будет вычисляться позже)
-                    UNIQUE(symbol, timestamp)
-                )
-            """)
-            
-            # Индексы для iv_history
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_iv_history_symbol 
-                ON iv_history(symbol)
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_iv_history_timestamp 
-                ON iv_history(timestamp)
             """)
             
             # Таблица уровней поддержки/сопротивления (от пользователя)
@@ -564,13 +545,6 @@ class OptionDatabase:
                 strike
             ))
             
-            # Сохраняем IV в отдельную таблицу для быстрого доступа
-            if iv is not None:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO iv_history (symbol, timestamp, iv)
-                    VALUES (?, ?, ?)
-                """, (symbol, date_data_collection_str, iv))
-            
             # Сохраняем цену базового актива
             underlying_price = option_data.get('underlying_price')
             if underlying_price is not None:
@@ -724,7 +698,7 @@ class OptionDatabase:
             current_iv: Текущее значение IV для опциона (если None, берется последнее из истории похожих)
             
         Returns:
-            Словарь со статистикой: min, max, mean, current, percentiles, count
+            Словарь со статистикой: min, max, mean, current, count, p25, p30, p65, p75, p90, p95 (при достаточном объёме данных).
         """
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -785,13 +759,16 @@ class OptionDatabase:
                 'similar_symbols_count': unique_symbols  # Сколько разных тикеров использовалось
             }
             
-            # Вычисляем процентили, если есть достаточно данных
+            # Вычисляем процентили, если есть достаточно данных (в т.ч. p30, p65 для чек-листа п.3)
             if len(iv_values) >= 10:
                 sorted_iv = sorted(iv_values)
-                result['p25'] = sorted_iv[int(len(sorted_iv) * 0.25)]
-                result['p75'] = sorted_iv[int(len(sorted_iv) * 0.75)]
-                result['p90'] = sorted_iv[int(len(sorted_iv) * 0.90)]
-                result['p95'] = sorted_iv[int(len(sorted_iv) * 0.95)]
+                n = len(sorted_iv)
+                result['p25'] = sorted_iv[int(n * 0.25)]
+                result['p30'] = sorted_iv[int(n * 0.30)]
+                result['p65'] = sorted_iv[int(n * 0.65)]
+                result['p75'] = sorted_iv[int(n * 0.75)]
+                result['p90'] = sorted_iv[int(n * 0.90)]
+                result['p95'] = sorted_iv[int(n * 0.95)]
             
             logger.info(
                 f"Статистика IV для похожих опционов: underlying={underlying_ticker}, "
@@ -1174,7 +1151,6 @@ class OptionDatabase:
             {
                 'option_history': int,
                 'underlying_history': int,
-                'iv_history': int,
                 'support_resistance_levels': int,
                 'agent_signals': int,
                 'signal_results': int,
@@ -1194,7 +1170,6 @@ class OptionDatabase:
             tables = [
                 'option_history',
                 'underlying_history',
-                'iv_history',
                 'support_resistance_levels',
                 'agent_signals',
                 'signal_results',
@@ -1244,7 +1219,6 @@ class OptionDatabase:
                 'error': str(e),
                 'option_history': 0,
                 'underlying_history': 0,
-                'iv_history': 0,
                 'support_resistance_levels': 0,
                 'agent_signals': 0,
                 'signal_results': 0,
@@ -1353,14 +1327,16 @@ class OptionDatabase:
         since: datetime
     ) -> List[Dict]:
         """
-        Получить историю опционов для расчета динамических порогов
+        Получить историю опционов для расчета динамических порогов.
+        В выборку входят поля для расчёта IV_ATM: underlying_price, option_type, strike, expiration_date.
         """
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
             since_local = self._format_local_datetime(since)
             query = """
-                SELECT symbol, date_data_collection, delta, gamma, vega, volume_24h, iv
+                SELECT symbol, date_data_collection, delta, gamma, vega, volume_24h, iv,
+                       underlying_price, option_type, strike, expiration_date
                 FROM option_history
                 WHERE underlying_ticker = ?
                   AND days_to_expiration >= ?
@@ -1464,6 +1440,142 @@ class OptionDatabase:
             if iv_atm is not None:
                 result.append((hour_ts, iv_atm))
         return result
+
+    def get_option_snapshots_hourly(
+        self,
+        underlying: str,
+        expiration_str: str,
+        hours: int = 168
+    ) -> Dict[str, List[Dict]]:
+        """
+        Снимки доски опционов на границе каждого часа за последние hours часов.
+        Для расчёта RR25, BF25 и IV_ATM по истории (чек-лист входа).
+        Returns:
+            {hour_ts: [row with iv, delta, strike, option_type, underlying_price], ...}
+        """
+        from core.data.option_board import parse_expiration_date
+        from collections import defaultdict
+        exp_date = parse_expiration_date(expiration_str.upper())
+        if not exp_date:
+            return {}
+        since = datetime.now() - timedelta(hours=hours)
+        since_str = self._format_local_datetime(since)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT date_data_collection, underlying_price, iv, option_type, strike, delta
+                FROM option_history
+                WHERE underlying_ticker = ? AND expiration_date = ? AND date_data_collection >= ?
+                  AND strftime('%M', date_data_collection) = '00'
+                  AND iv IS NOT NULL
+                ORDER BY date_data_collection ASC, strike ASC
+            """, (underlying.upper(), exp_date.isoformat(), since_str))
+            rows = [dict(r) for r in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка get_option_snapshots_hourly: {e}")
+            return {}
+        finally:
+            conn.close()
+        by_hour: Dict[str, List[Dict]] = defaultdict(list)
+        for r in rows:
+            dt = r.get("date_data_collection")
+            if not dt:
+                continue
+            hour_ts = dt[:16] if isinstance(dt, str) and len(dt) >= 16 else (
+                dt.strftime("%Y-%m-%d %H:00") if hasattr(dt, "strftime") else str(dt)
+            )
+            by_hour[hour_ts].append(r)
+        return dict(by_hour)
+
+    def get_option_snapshot_at_hour(
+        self,
+        underlying: str,
+        expiration_date: date,
+        hour_ts: str
+    ) -> List[Dict]:
+        """
+        Снимок доски опционов на границе одного часа для заданной экспирации.
+        hour_ts в формате "YYYY-MM-DD HH:00" (локальное время, как в БД).
+        Returns:
+            [row с iv, option_type, strike, underlying_price], ...
+        """
+        from datetime import datetime as dt
+        if len(hour_ts) < 16:
+            return []
+        try:
+            y, m, d = int(hour_ts[:4]), int(hour_ts[5:7]), int(hour_ts[8:10])
+            h = int(hour_ts[11:13])
+            next_dt = dt(y, m, d, h, 0, 0) + timedelta(hours=1)
+            hour_next = next_dt.strftime("%Y-%m-%d %H:00")
+        except (ValueError, IndexError):
+            hour_next = hour_ts[:10] + " " + str((int(hour_ts[11:13]) + 1) % 24).zfill(2) + ":00"
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT date_data_collection, underlying_price, iv, option_type, strike, delta
+                FROM option_history
+                WHERE underlying_ticker = ? AND expiration_date = ?
+                  AND date_data_collection >= ? AND date_data_collection < ?
+                  AND iv IS NOT NULL
+                ORDER BY strike ASC
+            """, (underlying.upper(), expiration_date.isoformat(), hour_ts, hour_next))
+            rows = cursor.fetchall()
+            return [dict(r) for r in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка get_option_snapshot_at_hour: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def get_option_snapshots_hourly_by_dte(
+        self,
+        underlying_ticker: str,
+        days_to_expiration: int,
+        hours: int = 168
+    ) -> Dict[str, List[Dict]]:
+        """
+        Снимки доски опционов на границе каждого часа за последние hours часов
+        по похожим опционам: один underlying и один days_to_expiration, без привязки к дате экспирации.
+
+        Используется когда время жизни опциона меньше запрашиваемой истории (например, 7 дней):
+        для коротких опционов по одной экспирации точек мало, по тому же DTE за 7 дней — достаточно.
+
+        Returns:
+            {hour_ts: [row with date_data_collection, underlying_price, iv, option_type, strike, delta], ...}
+        """
+        from collections import defaultdict
+        since = datetime.now() - timedelta(hours=hours)
+        since_str = self._format_local_datetime(since)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT date_data_collection, underlying_price, iv, option_type, strike, delta
+                FROM option_history
+                WHERE underlying_ticker = ? AND days_to_expiration = ?
+                  AND date_data_collection >= ?
+                  AND strftime('%M', date_data_collection) = '00'
+                  AND iv IS NOT NULL
+                ORDER BY date_data_collection ASC, strike ASC
+            """, (underlying_ticker.upper(), days_to_expiration, since_str))
+            rows = [dict(r) for r in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка get_option_snapshots_hourly_by_dte: {e}")
+            return {}
+        finally:
+            conn.close()
+        by_hour: Dict[str, List[Dict]] = defaultdict(list)
+        for r in rows:
+            dt = r.get("date_data_collection")
+            if not dt:
+                continue
+            hour_ts = dt[:16] if isinstance(dt, str) and len(dt) >= 16 else (
+                dt.strftime("%Y-%m-%d %H:00") if hasattr(dt, "strftime") else str(dt)
+            )
+            by_hour[hour_ts].append(r)
+        return dict(by_hour)
 
     def get_oi_hourly(
         self,
@@ -1586,6 +1698,72 @@ class OptionDatabase:
             logger.error(f"Ошибка при удалении пресета GEX: {e}")
             conn.rollback()
             return False
+        finally:
+            conn.close()
+
+    def get_gex_monitor_settings(self, user_id: int) -> Optional[Dict]:
+        """Получить настройки мониторинга GEX пользователя. Возвращает dict с threshold, interval_minutes или None для полей."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT user_id, threshold, interval_minutes, updated_at
+                FROM gex_monitor_settings WHERE user_id = ?
+            """, (user_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return {'threshold': None, 'interval_minutes': None, 'updated_at': None}
+            return dict(row)
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при получении настроек мониторинга GEX: {e}")
+            return {'threshold': None, 'interval_minutes': None, 'updated_at': None}
+        finally:
+            conn.close()
+
+    def set_gex_monitor_threshold(self, user_id: int, value: float) -> None:
+        """Установить порог оповещения мониторинга GEX для пользователя (обновить при наличии). Хранится как float с 2 знаками после запятой."""
+        value = round(float(value), 2)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT 1 FROM gex_monitor_settings WHERE user_id = ?", (user_id,))
+            if cursor.fetchone():
+                cursor.execute(
+                    "UPDATE gex_monitor_settings SET threshold = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                    (value, user_id)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO gex_monitor_settings (user_id, threshold, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (user_id, value)
+                )
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при установке порога GEX: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def set_gex_monitor_interval(self, user_id: int, interval_minutes: int) -> None:
+        """Установить частоту проверки (мин) мониторинга GEX для пользователя."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT 1 FROM gex_monitor_settings WHERE user_id = ?", (user_id,))
+            if cursor.fetchone():
+                cursor.execute(
+                    "UPDATE gex_monitor_settings SET interval_minutes = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+                    (interval_minutes, user_id)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO gex_monitor_settings (user_id, interval_minutes, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (user_id, interval_minutes)
+                )
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Ошибка при установке частоты мониторинга GEX: {e}")
+            conn.rollback()
         finally:
             conn.close()
 

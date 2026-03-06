@@ -626,7 +626,6 @@ async def get_database_stats():
         result = {
             'option_history': stats.get('option_history', 0),
             'underlying_history': stats.get('underlying_history', 0),
-            'iv_history': stats.get('iv_history', 0),
             'support_resistance_levels': stats.get('support_resistance_levels', 0),
             'agent_signals': stats.get('agent_signals', 0),  # Используем правильное имя
             'signal_results': stats.get('signal_results', 0),
@@ -641,7 +640,6 @@ async def get_database_stats():
         return {
             'option_history': 0,
             'underlying_history': 0,
-            'iv_history': 0,
             'support_resistance_levels': 0,
             'agent_signals': 0,
             'signal_results': 0,

@@ -18,7 +18,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG, format_datetime_local
+from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG, format_datetime_local, DISPLAY_TIMEZONE
 from services.websocket_manager import ws_manager
 from services.data_store import data_store
 from core.data.option_board import get_option_board
@@ -28,11 +28,15 @@ from core.agent.trading_agent import get_trading_agent
 from core.strategy.gex_calculator import (
     options_from_datastore_for_gex,
     calculate_gex_by_strike,
+    max_abs_gex,
     build_gex_chart_png,
+    build_oi_by_strike_chart_png,
     build_iv_chart_png,
     build_oi_chart_png,
     compute_iv_atm_from_board,
+    build_volatility_smile_chart_png_three_series,
 )
+from core.strategy.entry_checklist import run_entry_checklist
 from utils.logging_config import setup_service_logging
 
 # Настройка логирования с ротацией файлов
@@ -86,7 +90,10 @@ CHECK_INTERVAL = 5  # Интервал проверки в секундах
     GEX_CHOOSING_UNDERLYING,
     GEX_ENTERING_DAY,
     GEX_CHOOSING_MONTH,
-) = range(14)
+    GEX_MONITOR_MENU,
+    GEX_MONITOR_ENTER_THRESHOLD,
+    GEX_MONITOR_ENTER_INTERVAL,
+) = range(17)
 
 # Константы
 CANCEL_TEXT = "❌ Отмена"
@@ -156,9 +163,8 @@ class TelegramOptionBot:
         Создать клавиатуру главного меню с группировкой кнопок
         
         Группы:
-        - 📊 Аналитика: Агент, Уровни S/R
-        - 💼 Управление позицией: Добавить опцион, Удалить опцион, Статус мониторинга, 
-          Запустить мониторинг, Остановить мониторинг, Текущие цены, Активные сигналы
+        - 📊 Аналитика: Агент, Уровни S/R, Расчёт индикаторов
+        - 💼 Мониторинг пар (подменю): Добавить/Удалить опцион, Статус, Цены, Запуск/Остановка, Активные сигналы
         """
         # Группа "Аналитика"
         analytics_group = [
@@ -170,24 +176,10 @@ class TelegramOptionBot:
                 InlineKeyboardButton("📈 Расчёт индикаторов", callback_data="gex_menu")
             ]
         ]
-        
-        # Группа "Управление позицией"
+
+        # Кнопка "Мониторинг пар" — ведёт в подменю с управлением парами опционов
         position_management_group = [
-            [
-                InlineKeyboardButton("➕ Добавить опцион", callback_data="add_option"),
-                InlineKeyboardButton("🗑️ Удалить опцион", callback_data="remove_option")
-            ],
-            [
-                InlineKeyboardButton("📊 Статус мониторинга", callback_data="monitoring_status"),
-                InlineKeyboardButton("📈 Текущие цены", callback_data="current_prices")
-            ],
-            [
-                InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="start_monitoring"),
-                InlineKeyboardButton("⏹️ Остановить мониторинг", callback_data="stop_monitoring")
-            ],
-            [
-                InlineKeyboardButton("🚨 Активные сигналы", callback_data="active_signals")
-            ]
+            [InlineKeyboardButton("📋 Мониторинг пар", callback_data="pair_monitoring_menu")]
         ]
         return analytics_group + position_management_group + [
             [InlineKeyboardButton("❓ Помощь", callback_data="help")]
@@ -212,9 +204,9 @@ class TelegramOptionBot:
             "Я бот для отслеживания опционов Bybit.\n"
             "Отслеживаю равенство цен Call/Put для Стренгла.\n\n"
             "📊 <b>Аналитика</b>\n"
-            "Агент | Уровни S/R\n\n"
-            "💼 <b>Управление позицией</b>\n"
-            "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
+            "Агент | Уровни S/R | Расчёт индикаторов\n\n"
+            "💼 <b>Мониторинг пар</b>\n"
+            "Равенство цен Call/Put для входа в Стрэнгл"
         )
         await update.message.reply_text(
             message_text,
@@ -238,8 +230,8 @@ class TelegramOptionBot:
             f"Пользователь: {user.first_name}\n\n"
             "📊 <b>Аналитика</b>\n"
             "Агент | Уровни S/R | Расчёт индикаторов\n\n"
-            "💼 <b>Управление позицией</b>\n"
-            "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
+            "💼 <b>Мониторинг пар</b>\n"
+            "Равенство цен Call/Put для входа в Стрэнгл"
         )
         await update.message.reply_text(
             message_text,
@@ -302,6 +294,8 @@ class TelegramOptionBot:
             return await self.cancel_operation(update, context)
         elif action == "back_to_menu":
             return await self.back_to_main_menu(update, context)
+        elif action == "pair_monitoring_menu":
+            return await self.show_pair_monitoring_menu(update, context)
         elif action.startswith("underlying_"):
             return await self.handle_underlying_selection(update, context)
         elif action.startswith("month_"):
@@ -318,6 +312,8 @@ class TelegramOptionBot:
             return await self.gex_list_presets(update, context)
         elif action == "gex_calc":
             return await self.gex_calculate_all(update, context)
+        elif action == "checklist_run":
+            return await self.checklist_run(update, context)
         elif action.startswith("gex_underlying_"):
             return await self.gex_handle_underlying(update, context)
         elif action.startswith("gex_month_"):
@@ -352,9 +348,9 @@ class TelegramOptionBot:
             f"👋 <b>Главное меню</b>\n\n"
             f"Пользователь: {user.first_name}\n\n"
             "📊 <b>Аналитика</b>\n"
-            "Агент | Уровни S/R\n\n"
-            "💼 <b>Управление позицией</b>\n"
-            "Добавить/Удалить опцион | Мониторинг | Цены | Сигналы"
+            "Агент | Уровни S/R | Расчёт индикаторов\n\n"
+            "💼 <b>Мониторинг пар</b>\n"
+            "Равенство цен Call/Put для входа в Стрэнгл"
         )
 
         if is_query:
@@ -372,6 +368,42 @@ class TelegramOptionBot:
             )
 
         return ConversationHandler.END
+
+    def _get_pair_monitoring_menu_keyboard(self):
+        """Клавиатура подменю «Мониторинг пар»."""
+        return [
+            [
+                InlineKeyboardButton("➕ Добавить опцион", callback_data="add_option"),
+                InlineKeyboardButton("🗑️ Удалить опцион", callback_data="remove_option")
+            ],
+            [
+                InlineKeyboardButton("📊 Статус мониторинга", callback_data="monitoring_status"),
+                InlineKeyboardButton("📈 Текущие цены", callback_data="current_prices")
+            ],
+            [
+                InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="start_monitoring"),
+                InlineKeyboardButton("⏹️ Остановить мониторинг", callback_data="stop_monitoring")
+            ],
+            [InlineKeyboardButton("🚨 Активные сигналы", callback_data="active_signals")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_menu")]
+        ]
+
+    async def show_pair_monitoring_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать подменю «Мониторинг пар» (равенство цен для входа в Стрэнгл)."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if query:
+            await query.answer()
+        keyboard = self._get_pair_monitoring_menu_keyboard()
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = (
+            "📋 <b>Мониторинг пар</b>\n\n"
+            "Управление парами опционов и отслеживание равенства цен Call/Put для входа в Стрэнгл."
+        )
+        if query:
+            await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=reply_markup)
+        return CHOOSING_ACTION
 
     async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать справку"""
@@ -430,12 +462,15 @@ class TelegramOptionBot:
             [InlineKeyboardButton("➕ Добавить экспирацию", callback_data="gex_add_preset")],
             [InlineKeyboardButton("📋 Список экспираций", callback_data="gex_list_presets")],
             [InlineKeyboardButton("📊 Рассчитать индикаторы", callback_data="gex_calc")],
+            [InlineKeyboardButton("📉 Мониторинг GEX", callback_data="gex_monitor_menu")],
+            [InlineKeyboardButton("✅ Проверка входа по чек-листу", callback_data="checklist_run")],
             [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         text = (
             "📈 <b>Расчёт индикаторов</b>\n\n"
-            "Экспирация = тикер + дата. По нажатию «Рассчитать индикаторы» строятся графики GEX, IV (ATM) и OI по каждой добавленной экспирации (опционы с DTE ≤ 3)."
+            "Экспирация = тикер + дата. По нажатию «Рассчитать индикаторы» строятся графики GEX, IV (ATM) и OI по каждой добавленной экспирации (опционы с DTE ≤ 3). "
+            "«Проверка входа по чек-листу» оценивает условия входа по 9 параметрам."
         )
         if query:
             await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
@@ -517,6 +552,8 @@ class TelegramOptionBot:
             [InlineKeyboardButton("➕ Добавить экспирацию", callback_data="gex_add_preset")],
             [InlineKeyboardButton("📋 Список экспираций", callback_data="gex_list_presets")],
             [InlineKeyboardButton("📊 Рассчитать индикаторы", callback_data="gex_calc")],
+            [InlineKeyboardButton("📉 Мониторинг GEX", callback_data="gex_monitor_menu")],
+            [InlineKeyboardButton("✅ Проверка входа по чек-листу", callback_data="checklist_run")],
             [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
         ]
         await context.bot.send_message(
@@ -564,6 +601,301 @@ class TelegramOptionBot:
             await query.edit_message_text("❌ Не удалось удалить экспирацию.")
         return await self.gex_list_presets(update, context)
 
+    # ===== Мониторинг GEX по порогу =====
+
+    def _gex_monitor_menu_keyboard(self):
+        """Клавиатура меню мониторинга GEX."""
+        return [
+            [InlineKeyboardButton("🔔 Задать порог оповещения", callback_data="gex_monitor_set_threshold")],
+            [InlineKeyboardButton("⏱ Задать частоту проверки", callback_data="gex_monitor_set_interval")],
+            [InlineKeyboardButton("▶️ Запустить мониторинг", callback_data="gex_monitor_start")],
+            [InlineKeyboardButton("⏹ Остановить мониторинг", callback_data="gex_monitor_stop")],
+            [InlineKeyboardButton("📊 Статус мониторинга", callback_data="gex_monitor_status")],
+            [InlineKeyboardButton("⚙ Параметры мониторинга GEX", callback_data="gex_monitor_params")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="gex_monitor_back")],
+        ]
+
+    async def gex_monitor_show_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать меню мониторинга GEX (вход в подменю)."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if query:
+            await query.answer()
+        keyboard = self._gex_monitor_menu_keyboard()
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = (
+            "📉 <b>Мониторинг GEX</b>\n\n"
+            "Отслеживание максимального отклонения GEX по модулю по страйкам. "
+            "При превышении порога придёт оповещение, мониторинг остановится автоматически.\n\n"
+            "Задайте порог и частоту проверки, затем запустите мониторинг. Используются экспирации из раздела «Расчёт индикаторов»."
+        )
+        if query:
+            await query.edit_message_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=reply_markup)
+        return GEX_MONITOR_MENU
+
+    async def gex_monitor_handle_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка кнопок в меню мониторинга GEX."""
+        query = update.callback_query
+        await query.answer()
+        action = query.data
+        if action == "gex_monitor_set_threshold":
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="gex_monitor_menu")]]
+            await query.edit_message_text(
+                "🔔 <b>Порог оповещения</b>\n\n"
+                "Введите положительное число (порог в единицах GEX, до 2 знаков после запятой). "
+                "Десятичное число вводите через точку.",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return GEX_MONITOR_ENTER_THRESHOLD
+        if action == "gex_monitor_set_interval":
+            keyboard = [[InlineKeyboardButton("⬅️ Назад", callback_data="gex_monitor_menu")]]
+            await query.edit_message_text(
+                "⏱ <b>Частота проверки</b>\n\nВведите интервал в минутах (целое число > 0):",
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return GEX_MONITOR_ENTER_INTERVAL
+        if action == "gex_monitor_start":
+            return await self._gex_monitor_start(update, context)
+        if action == "gex_monitor_stop":
+            return await self._gex_monitor_stop(update, context)
+        if action == "gex_monitor_status":
+            return await self._gex_monitor_status(update, context)
+        if action == "gex_monitor_params":
+            return await self._gex_monitor_params(update, context)
+        if action == "gex_monitor_back":
+            await self.gex_show_menu(update, context)
+            return ConversationHandler.END
+        return GEX_MONITOR_MENU
+
+    async def gex_monitor_fallback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Fallback: назад в меню GEX или возврат в подменю мониторинга."""
+        query = update.callback_query
+        if query:
+            await query.answer()
+        if query.data == "gex_monitor_back":
+            await self.gex_show_menu(update, context)
+            return ConversationHandler.END
+        if query.data == "gex_monitor_menu":
+            return await self.gex_monitor_show_menu(update, context)
+
+    async def gex_monitor_handle_threshold_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода порога мониторинга GEX."""
+        text = update.message.text.strip().replace(",", ".")
+        try:
+            value = float(text)
+        except ValueError:
+            await update.message.reply_text("❌ Введите число (например 50000 или 100000).")
+            return GEX_MONITOR_ENTER_THRESHOLD
+        if value <= 0:
+            await update.message.reply_text("❌ Порог должен быть положительным числом.")
+            return GEX_MONITOR_ENTER_THRESHOLD
+        user_id = update.effective_user.id
+        value = round(value, 2)
+        self.db.set_gex_monitor_threshold(user_id, value)
+        keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+        await update.message.reply_text(
+            f"✅ <b>Порог сохранён:</b> {value:,.2f}",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return GEX_MONITOR_MENU
+
+    async def gex_monitor_handle_interval_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода частоты проверки (мин)."""
+        text = update.message.text.strip()
+        if not text.isdigit():
+            await update.message.reply_text("❌ Введите целое число минут (например 5 или 10).")
+            return GEX_MONITOR_ENTER_INTERVAL
+        value = int(text)
+        if value <= 0:
+            await update.message.reply_text("❌ Интервал должен быть больше 0.")
+            return GEX_MONITOR_ENTER_INTERVAL
+        user_id = update.effective_user.id
+        self.db.set_gex_monitor_interval(user_id, value)
+        keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+        await update.message.reply_text(
+            f"✅ <b>Частота проверки сохранена:</b> {value} мин",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return GEX_MONITOR_MENU
+
+    async def _gex_monitor_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запуск мониторинга GEX: проверка настроек, при необходимости одна проверка, создание job."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        settings = self.db.get_gex_monitor_settings(user_id)
+        threshold = settings.get("threshold")
+        interval_minutes = settings.get("interval_minutes")
+        if threshold is None or interval_minutes is None or threshold <= 0 or interval_minutes <= 0:
+            keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+            msg = "⚠️ <b>Сначала задайте порог и частоту.</b>\n\nУкажите порог оповещения и интервал проверки в минутах."
+            if query:
+                await query.edit_message_text(msg, parse_mode='HTML', reply_markup=keyboard)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=keyboard)
+            return GEX_MONITOR_MENU
+        presets = self.db.get_gex_presets(user_id)
+        if not presets:
+            keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+            msg = "⚠️ Нет экспираций. Добавьте экспирации в разделе «Расчёт индикаторов»."
+            if query:
+                await query.edit_message_text(msg, parse_mode='HTML', reply_markup=keyboard)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=keyboard)
+            return GEX_MONITOR_MENU
+        all_data = data_store.get_all()
+        exceeded_expirations = []
+        for p in presets:
+            opts = options_from_datastore_for_gex(all_data, p["underlying"], p["expiration_str"])
+            if not opts:
+                continue
+            gex_by_strike = calculate_gex_by_strike(opts)
+            max_val, _ = max_abs_gex(gex_by_strike)
+            if max_val > threshold:
+                exceeded_expirations.append((p["underlying"], p["expiration_str"], max_val))
+        if exceeded_expirations:
+            for underlying, exp_str, max_val in exceeded_expirations:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ <b>Превышен порог по GEX</b>\n\n"
+                        f"Экспирация: <b>{underlying} {exp_str}</b>\n"
+                        f"Макс. |GEX|: {max_val:,.0f} (порог: {threshold:,.2f})\n\n"
+                        f"Мониторинг остановлен автоматически."
+                    ),
+                    parse_mode='HTML'
+                )
+            keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+            await query.edit_message_text(
+                "⏹ Мониторинг не запущен: порог уже превышен по указанным экспирациям. Задайте больший порог или дождитесь снижения GEX.",
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
+            return GEX_MONITOR_MENU
+        if context.job_queue:
+            current_jobs = context.job_queue.get_jobs_by_name(f"gex_monitor_{user_id}")
+            for job in current_jobs:
+                job.schedule_removal()
+            context.job_queue.run_repeating(
+                self._gex_monitor_job,
+                interval=interval_minutes * 60,
+                first=1,
+                name=f"gex_monitor_{user_id}",
+                data={"user_id": user_id, "chat_id": chat_id}
+            )
+            logger.info(f"Started GEX monitor job for user {user_id}, interval={interval_minutes} min")
+        keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+        await query.edit_message_text(
+            f"✅ <b>Мониторинг GEX запущен</b>\n\nПорог: {threshold:,.2f}\nЧастота: {interval_minutes} мин\nЭкспираций: {len(presets)}",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return GEX_MONITOR_MENU
+
+    async def _gex_monitor_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Остановка мониторинга GEX."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if context.job_queue:
+            current_jobs = context.job_queue.get_jobs_by_name(f"gex_monitor_{user_id}")
+            for job in current_jobs:
+                job.schedule_removal()
+            if current_jobs:
+                logger.info(f"Stopped GEX monitor job for user {user_id}")
+        keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+        await query.edit_message_text(
+            "⏹ <b>Мониторинг GEX остановлен</b>",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return GEX_MONITOR_MENU
+
+    async def _gex_monitor_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Статус мониторинга GEX."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        running = False
+        if context.job_queue:
+            jobs = context.job_queue.get_jobs_by_name(f"gex_monitor_{user_id}")
+            running = bool(jobs)
+        settings = self.db.get_gex_monitor_settings(user_id)
+        threshold = settings.get("threshold")
+        interval = settings.get("interval_minutes")
+        status_text = "🟢 <b>Активен</b>" if running else "🔴 <b>Остановлен</b>"
+        params = f"Порог: {threshold:,.2f}" if threshold is not None else "Порог: не задан"
+        params += f"\nЧастота: {interval} мин" if interval is not None else "\nЧастота: не задана"
+        keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+        await query.edit_message_text(
+            f"📊 <b>Статус мониторинга GEX</b>\n\n{status_text}\n\n{params}",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return GEX_MONITOR_MENU
+
+    async def _gex_monitor_params(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать параметры мониторинга GEX (порог и частота)."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        settings = self.db.get_gex_monitor_settings(user_id)
+        threshold = settings.get("threshold")
+        interval = settings.get("interval_minutes")
+        t_str = f"{threshold:,.2f}" if threshold is not None else "не задан"
+        i_str = f"{interval} мин" if interval is not None else "не задана"
+        keyboard = InlineKeyboardMarkup(self._gex_monitor_menu_keyboard())
+        await query.edit_message_text(
+            f"⚙ <b>Параметры мониторинга GEX</b>\n\n🔔 Порог оповещения: {t_str}\n⏱ Частота проверки: {i_str}",
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        return GEX_MONITOR_MENU
+
+    async def _gex_monitor_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Периодическая проверка GEX: при превышении порога — оповещение и остановка job."""
+        job = context.job
+        data = job.data if isinstance(job.data, dict) else {}
+        user_id = data.get("user_id")
+        chat_id = data.get("chat_id")
+        if user_id is None or chat_id is None:
+            return
+        settings = self.db.get_gex_monitor_settings(user_id)
+        threshold = settings.get("threshold")
+        if threshold is None or threshold <= 0:
+            job.schedule_removal()
+            return
+        presets = self.db.get_gex_presets(user_id)
+        if not presets:
+            return
+        all_data = data_store.get_all()
+        exceeded = []
+        for p in presets:
+            opts = options_from_datastore_for_gex(all_data, p["underlying"], p["expiration_str"])
+            if not opts:
+                continue
+            gex_by_strike = calculate_gex_by_strike(opts)
+            max_val, strike_at = max_abs_gex(gex_by_strike)
+            if max_val > threshold:
+                exceeded.append((p["underlying"], p["expiration_str"], max_val, strike_at))
+        if not exceeded:
+            return
+        for underlying, exp_str, max_val, strike_at in exceeded:
+            strike_info = f" (страйк {strike_at:,.0f})" if strike_at is not None else ""
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ <b>Превышен порог по GEX</b>\n\n"
+                        f"Экспирация: <b>{underlying} {exp_str}</b>\n"
+                        f"Макс. |GEX|: {max_val:,.0f}{strike_info}\n"
+                        f"Порог: {threshold:,.2f}\n\n"
+                        f"Мониторинг остановлен автоматически."
+                    ),
+                    parse_mode='HTML'
+                )
+            except Exception as e:
+                logger.error(f"GEX monitor: failed to send alert: {e}")
+        job.schedule_removal()
+        logger.info(f"GEX monitor: threshold exceeded for user {user_id}, job removed")
+
     async def gex_calculate_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Рассчитать GEX по всем пресетам пользователя и отправить графики."""
         user_id, chat_id, _, query = self._get_user_info(update)
@@ -609,8 +941,13 @@ class TelegramOptionBot:
             )
             await context.bot.send_photo(chat_id=chat_id, photo=png_bytes, caption=title)
             sent += 1
+            # OI по страйкам (гистограмма: Calls и Puts на одной диаграмме)
+            oi_strike_png = build_oi_by_strike_chart_png(all_data, underlying, exp_str, underlying_price=underlying_price)
+            if oi_strike_png:
+                await context.bot.send_photo(chat_id=chat_id, photo=oi_strike_png, caption=f"OI по страйкам {underlying} {exp_str}")
+                sent += 1
             # IV (ATM) по часам из снимков на границе часа; текущее IV_ATM — из текущей доски
-            iv_series = self.db.get_iv_atm_hourly(underlying, exp_str, hours=8)
+            iv_series = self.db.get_iv_atm_hourly(underlying, exp_str, hours=24)
             current_iv = compute_iv_atm_from_board(all_data, underlying, exp_str)
             if iv_series:
                 iv_title = f"IV (ATM) {underlying} {exp_str}"
@@ -618,7 +955,7 @@ class TelegramOptionBot:
                 await context.bot.send_photo(chat_id=chat_id, photo=iv_png, caption=iv_title + (f"  |  Текущее: {current_iv:.2%}" if current_iv is not None else ""))
                 sent += 1
             # OI по часам за 8 часов из БД (снимок на границе часа); текущее OI — из текущей доски
-            oi_series = self.db.get_oi_hourly(underlying, exp_str, hours=8)
+            oi_series = self.db.get_oi_hourly(underlying, exp_str, hours=24)
             current_oi = sum(
                 (d.get("open_interest") or 0) for sym, d in all_data.items()
                 if sym.startswith(f"{underlying}-{exp_str}-")
@@ -628,10 +965,93 @@ class TelegramOptionBot:
                 oi_png = build_oi_chart_png(oi_series, title=oi_title, current_oi=current_oi if current_oi else None)
                 await context.bot.send_photo(chat_id=chat_id, photo=oi_png, caption=oi_title + (f"  |  Текущее: {current_oi:,.0f}" if current_oi else ""))
                 sent += 1
+            # Улыбка волатильности: текущая + 2 ч назад + вчера 20:00 (экспирация на день раньше)
+            now_local = datetime.now(DISPLAY_TIMEZONE)
+            two_hours_ago = (now_local - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+            hour_ts_2h = two_hours_ago.strftime("%Y-%m-%d %H:00")
+            yesterday_date = (now_local.date() - timedelta(days=1))
+            yesterday_20_ts = f"{yesterday_date.isoformat()} 20:00"
+            snapshots_3h = self.db.get_option_snapshots_hourly(underlying, exp_str, hours=3)
+            snapshot_2h = snapshots_3h.get(hour_ts_2h) if snapshots_3h else None
+            exp_date = self.db.parse_expiration_date(exp_str.upper())
+            exp_prev = (exp_date - timedelta(days=1)) if exp_date else None
+            snapshot_yesterday = self.db.get_option_snapshot_at_hour(underlying, exp_prev, yesterday_20_ts) if exp_prev else None
+            smile_png = build_volatility_smile_chart_png_three_series(
+                all_data, underlying, exp_str,
+                snapshot_2h_ago=snapshot_2h,
+                snapshot_yesterday=snapshot_yesterday,
+                label_2h="2 ч назад",
+                label_yesterday="Вчера 20:00",
+            )
+            if smile_png:
+                await context.bot.send_photo(chat_id=chat_id, photo=smile_png, caption=f"Улыбка волатильности {underlying} {exp_str}")
+                sent += 1
         if query and sent == 0:
             await query.edit_message_text("📊 По экспирациям нет данных для расчёта (нет опционов в доске с DTE ≤ 3).")
         elif query and sent > 0:
             await query.edit_message_text(f"✅ Отправлено графиков: {sent}")
+        return CHOOSING_ACTION
+
+    async def checklist_run(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Проверка входа по чек-листу: 9 параметров, итог 0–3 пропуск, 4–6 половинный размер, 7–9 полный вход."""
+        user_id, chat_id, _, query = self._get_user_info(update)
+        if query:
+            await query.answer()
+        presets = self.db.get_gex_presets(user_id)
+        if not presets:
+            text = "📋 Нет экспираций. Добавьте экспирацию в разделе «Расчёт индикаторов», затем нажмите «Проверка входа по чек-листу»."
+            if query:
+                await query.edit_message_text(text)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=text)
+            return CHOOSING_ACTION
+        all_data = data_store.get_all()
+        for p in presets:
+            underlying = p["underlying"]
+            exp_str = p["expiration_str"]
+            prefix = f"{underlying}-{exp_str}-"
+            if not any(s.startswith(prefix) for s in all_data.keys()):
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ {underlying} {exp_str}: нет данных в доске (подпишитесь на опционы или подождите обновления)."
+                )
+                continue
+            try:
+                results, score, interpretation = run_entry_checklist(
+                    underlying, exp_str, all_data, self.db
+                )
+            except Exception as e:
+                logger.exception("Ошибка чек-листа для %s %s", underlying, exp_str)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Ошибка расчёта чек-листа для {underlying} {exp_str}: {e}"
+                )
+                continue
+            lines = [f"✅ <b>Чек-лист входа</b> {underlying} {exp_str}\n"]
+            for label, passed in results:
+                icon = "✅" if passed else "❌"
+                lines.append(f"• <b>{label}</b> {icon}")
+            lines.append("")
+            # Прогресс-бар: заполненные и пустые клетки (вес каждого пункта = 1)
+            bar_filled = "█" * score
+            bar_empty = "░" * (9 - score)
+            lines.append(f"<b>Итог:</b> [{bar_filled}{bar_empty}] <b>{score}/9</b>")
+            # Жёсткие условия: п.1 (ATM IV не в пампе) и п.9 (BE реалистичны)
+            hard1_ok = results[0][1]
+            hard9_ok = results[8][1]
+            if not hard1_ok:
+                lines.append(f"🚫 <b>Не входить:</b> не выполнено жёсткое условие «{results[0][0]}»")
+            elif not hard9_ok:
+                lines.append(f"🚫 <b>Не входить:</b> не выполнено жёсткое условие «{results[8][0]}»")
+            else:
+                lines.append(f"<b>Интерпретация:</b> {interpretation}")
+                lines.append("<i>Жёсткие условия 1 и 9 выполнены.</i>")
+                if score <= 3:
+                    lines.append("<i>(0–3 → пропуск; 4–6 → половинный размер; 7–9 → полный вход)</i>")
+            text = "\n".join(lines)
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        if query and presets:
+            await query.edit_message_text("✅ Чек-лист отправлен по каждой экспирации.")
         return CHOOSING_ACTION
 
     # ===== ДОБАВЛЕНИЕ ОПЦИОНА =====
@@ -2657,6 +3077,29 @@ class TelegramOptionBot:
             ]
         )
         application.add_handler(gex_add_conv)
+
+        # ConversationHandler для мониторинга GEX (порог, частота, запуск/остановка)
+        gex_monitor_conv = ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(self.gex_monitor_show_menu, pattern="^gex_monitor_menu$")
+            ],
+            states={
+                GEX_MONITOR_MENU: [
+                    CallbackQueryHandler(self.gex_monitor_handle_button, pattern="^gex_monitor_")
+                ],
+                GEX_MONITOR_ENTER_THRESHOLD: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.gex_monitor_handle_threshold_input)
+                ],
+                GEX_MONITOR_ENTER_INTERVAL: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.gex_monitor_handle_interval_input)
+                ],
+            },
+            fallbacks=[
+                CallbackQueryHandler(self.gex_monitor_fallback, pattern="^gex_monitor_(back|menu)$"),
+                CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
+            ]
+        )
+        application.add_handler(gex_monitor_conv)
 
         application.add_handler(add_option_conv)
         application.add_handler(remove_option_conv)
