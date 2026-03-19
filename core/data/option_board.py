@@ -84,6 +84,27 @@ def parse_expiration_date(expiry_str: str) -> Optional[date]:
         return None
 
 
+def expiration_date_to_str(d: date) -> str:
+    """
+    Преобразование date в строку формата Bybit для экспирации.
+
+    Args:
+        d: Дата экспирации.
+
+    Returns:
+        Строка в формате "13MAR26" (день + месяц + год).
+
+    Examples:
+        date(2026, 3, 13) -> "13MAR26"
+        date(2026, 1, 4) -> "4JAN26"
+    """
+    month_names = (
+        'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+        'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'
+    )
+    return f"{d.day}{month_names[d.month - 1]}{d.year % 100:02d}"
+
+
 def is_otm(strike: float, underlying_price: float, option_type: str) -> bool:
     """
     Проверка: опцион OTM (Out of The Money)?

@@ -195,7 +195,12 @@ class OptionDatabase:
         except Exception as e:
             logger.error(f"Ошибка парсинга даты экспирации {expiry_str}: {e}")
             return None
-    
+
+    def expiration_date_to_str(self, d: date) -> str:
+        """Преобразование date в строку формата Bybit (например, '13MAR26')."""
+        from core.data.option_board import expiration_date_to_str as _expiration_date_to_str
+        return _expiration_date_to_str(d)
+
     def parse_option_symbol(self, symbol: str) -> Dict[str, any]:
         """
         Парсинг символа опциона для извлечения компонентов

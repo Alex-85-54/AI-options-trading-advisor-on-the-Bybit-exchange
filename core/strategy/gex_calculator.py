@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 # Максимальный DTE для учёта в GEX (дневные опционы)
 GEX_MAX_DTE = 5
 
+# Полуширина диапазона оси X (страйки) для центрирования графика по цене спота (±15 шагов по 500)
+CHART_HALF_SPAN = 7500
+
 
 def _parse_symbol(symbol: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
     """Извлечь (underlying, expiry_str, strike) из символа. expiry_str например 4JAN26."""
@@ -291,17 +294,17 @@ def build_gex_chart_png(
 
     strikes = sorted(gex_by_strike.keys())
     strikes = _strikes_centered_on_spot(strikes, underlying_price)
-    strike_to_idx = {s: i for i, s in enumerate(strikes)}
     values = [gex_by_strike[s] for s in strikes]
     colors = ['#2ecc71' if v >= 0 else '#e74c3c' for v in values]
+    step = (strikes[1] - strikes[0]) if len(strikes) > 1 else 500
+    bar_width = step * 0.85
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    bars = ax.bar(range(len(strikes)), values, color=colors, edgecolor='gray', linewidth=0.5)
+    bars = ax.bar(strikes, values, width=bar_width, color=colors, edgecolor='gray', linewidth=0.5)
     ax.axhline(y=0, color='black', linewidth=0.8)
     legend_handles = []
     if underlying_price is not None and strikes:
-        idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying_price))
-        ax.axvline(x=idx, color='blue', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
+        ax.axvline(x=underlying_price, color='blue', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
     if support_resistance_levels and strikes:
         support_strikes = set()
         for price in support_resistance_levels.get('support') or []:
@@ -314,11 +317,9 @@ def build_gex_chart_png(
             if s is not None:
                 resistance_strikes.add(s)
         for s in support_strikes:
-            idx = strike_to_idx[s]
-            ax.axvline(x=idx, color='#27ae60', linestyle='-', linewidth=1.2, alpha=0.9)
+            ax.axvline(x=s, color='#27ae60', linestyle='-', linewidth=1.2, alpha=0.9)
         for s in resistance_strikes:
-            idx = strike_to_idx[s]
-            ax.axvline(x=idx, color='#c0392b', linestyle='-', linewidth=1.2, alpha=0.9)
+            ax.axvline(x=s, color='#c0392b', linestyle='-', linewidth=1.2, alpha=0.9)
         if support_strikes:
             from matplotlib.lines import Line2D
             legend_handles.append(Line2D([0], [0], color='#27ae60', linewidth=2, label='Поддержка'))
@@ -330,7 +331,9 @@ def build_gex_chart_png(
         legend_handles.insert(0, Line2D([0], [0], color='blue', linestyle='--', linewidth=2, label=f'Spot ~{underlying_price:,.0f}'))
     if legend_handles:
         ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
-    ax.set_xticks(range(len(strikes)))
+    if underlying_price is not None:
+        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
+    ax.set_xticks(strikes)
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('GEX')
     ax.set_title(title)
@@ -393,16 +396,18 @@ def build_oi_by_strike_chart_png(
 
     oi_calls = [oi_call.get(s, 0) for s in strikes]
     oi_puts = [oi_put.get(s, 0) for s in strikes]
-    x = range(len(strikes))
-    width = 0.35
+    step = (strikes[1] - strikes[0]) if len(strikes) > 1 else 500
+    bar_half = step * 0.2  # сдвиг пары столбцов от центра страйка
+    bar_width = step * 0.4
 
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.bar([i - width / 2 for i in x], oi_calls, width, label='Calls', color='#3498db', edgecolor='gray', linewidth=0.5)
-    ax.bar([i + width / 2 for i in x], oi_puts, width, label='Puts', color='#e74c3c', edgecolor='gray', linewidth=0.5)
+    ax.bar([s - bar_half for s in strikes], oi_calls, bar_width, label='Calls', color='#3498db', edgecolor='gray', linewidth=0.5)
+    ax.bar([s + bar_half for s in strikes], oi_puts, bar_width, label='Puts', color='#e74c3c', edgecolor='gray', linewidth=0.5)
     if underlying_price is not None and strikes:
-        idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying_price))
-        ax.axvline(x=idx, color='gray', linestyle='--', linewidth=1.2, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
-    ax.set_xticks(x)
+        ax.axvline(x=underlying_price, color='gray', linestyle='--', linewidth=1.2, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
+    if underlying_price is not None:
+        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
+    ax.set_xticks(strikes)
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('Open Interest')
     ax.set_title(f"OI по страйкам {underlying} {expiration_str}")
@@ -509,10 +514,21 @@ def build_iv_chart_png(
     hour_labels = [_shorten_hour_label(h) for h in hours]
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(range(len(hours)), values, color='#3498db', marker='o', markersize=4, linewidth=1.5)
+    if current_iv is not None:
+        ax.axhline(
+            y=current_iv,
+            color="#e74c3c",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.85,
+            label=f"Текущее IV: {current_iv:.2%}",
+        )
     ax.set_xticks(range(len(hours)))
     ax.set_xticklabels(hour_labels, rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('IV (ATM)')
     ax.set_title(title + (f"  |  Текущее: {current_iv:.2%}" if current_iv is not None else ""))
+    if current_iv is not None:
+        ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO()
@@ -549,10 +565,21 @@ def build_oi_chart_png(
     hour_labels = [_shorten_hour_label(h) for h in hours]
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(range(len(hours)), values, color='#9b59b6', marker='s', markersize=4, linewidth=1.5)
+    if current_oi is not None:
+        ax.axhline(
+            y=current_oi,
+            color="#e74c3c",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.85,
+            label=f"Текущее OI: {current_oi:,.0f}",
+        )
     ax.set_xticks(range(len(hours)))
     ax.set_xticklabels(hour_labels, rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('Open Interest')
     ax.set_title(title + (f"  |  Текущее: {current_oi:,.0f}" if current_oi is not None else ""))
+    if current_oi is not None:
+        ax.legend(loc="upper left", fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     buf = io.BytesIO()
@@ -677,10 +704,10 @@ def build_volatility_smile_chart_png(
         ax.plot(strikes_p, ivs_p, color=color_puts, linewidth=1, alpha=0.9)
         ax.scatter(strikes_p, ivs_p, color=color_puts, label="Puts", alpha=0.8, s=30)
 
-    all_strikes = [s for s, _ in calls] + [s for s, _ in puts]
-    if underlying_price is not None and all_strikes:
-        nearest_strike = min(all_strikes, key=lambda s: abs(s - underlying_price))
-        ax.axvline(x=nearest_strike, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
+    if underlying_price is not None:
+        ax.axvline(x=underlying_price, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
+    if underlying_price is not None:
+        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
 
     ax.set_xlabel("Страйк")
     ax.set_ylabel("IV")
@@ -739,6 +766,19 @@ def build_volatility_smile_chart_png_three_series(
 
     calls_2h, puts_2h = _smile_from_snapshot_rows(snapshot_2h_ago) if snapshot_2h_ago else ([], [])
     calls_yest, puts_yest = _smile_from_snapshot_rows(snapshot_yesterday) if snapshot_yesterday else ([], [])
+
+    spot_2h = None
+    if snapshot_2h_ago and len(snapshot_2h_ago) > 0:
+        try:
+            spot_2h = float(snapshot_2h_ago[0].get("underlying_price"))
+        except (TypeError, ValueError):
+            pass
+    spot_yest = None
+    if snapshot_yesterday and len(snapshot_yesterday) > 0:
+        try:
+            spot_yest = float(snapshot_yesterday[0].get("underlying_price"))
+        except (TypeError, ValueError):
+            pass
 
     all_strikes_set = set()
     for c, p in [(calls_cur, puts_cur), (calls_2h, puts_2h), (calls_yest, puts_yest)]:
@@ -802,9 +842,14 @@ def build_volatility_smile_chart_png_three_series(
             ax.plot(strikes_p, ivs_p, color=color_p, linewidth=1.2, alpha=0.9)
             ax.scatter(strikes_p, ivs_p, color=color_p, label=f"{label} Puts", alpha=0.8, s=24)
 
-    if underlying_price is not None and strike_window:
-        nearest = min(strike_window, key=lambda s: abs(s - underlying_price))
-        ax.axvline(x=nearest, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
+    if underlying_price is not None:
+        ax.axvline(x=underlying_price, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
+    if spot_2h is not None:
+        ax.axvline(x=spot_2h, color="#e67e22", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ({label_2h}) ~{spot_2h:,.0f}")
+    if spot_yest is not None:
+        ax.axvline(x=spot_yest, color="#1abc9c", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ({label_yesterday}) ~{spot_yest:,.0f}")
+    if underlying_price is not None:
+        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
 
     ax.set_xlabel("Страйк")
     ax.set_ylabel("IV")

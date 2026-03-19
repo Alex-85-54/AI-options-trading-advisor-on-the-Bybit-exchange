@@ -494,27 +494,42 @@ class TelegramOptionBot:
         )
         return GEX_CHOOSING_UNDERLYING
 
+    def _gex_day_keyboard(self) -> InlineKeyboardMarkup:
+        """Клавиатура выбора дня месяца: плитка 5×6 (1–30), затем 31 и «Назад»."""
+        keyboard = []
+        for row_start in range(1, 31, 5):  # ряды по 5 кнопок: 1–5, 6–10, …, 26–30
+            row = [
+                InlineKeyboardButton(str(d), callback_data=f"gex_day_{d}")
+                for d in range(row_start, min(row_start + 5, 31))
+            ]
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("31", callback_data="gex_day_31")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
+        return InlineKeyboardMarkup(keyboard)
+
     async def gex_handle_underlying(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сохранить тикер пресета и запросить день экспирации."""
+        """Сохранить тикер пресета и показать выбор дня месяца (кнопки 1–31)."""
         query = update.callback_query
         await query.answer()
         underlying = query.data.replace("gex_underlying_", "")
         context.user_data["gex_underlying"] = underlying
+        reply_markup = self._gex_day_keyboard()
         await query.edit_message_text(
-            f"📈 Экспирация: <b>{underlying}</b>\n\nВведите число месяца экспирации (1–31):",
-            parse_mode='HTML'
+            f"📈 Экспирация: <b>{underlying}</b>\n\nВыберите число месяца экспирации:",
+            parse_mode='HTML',
+            reply_markup=reply_markup
         )
         return GEX_ENTERING_DAY
 
-    async def gex_handle_day_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода дня для пресета GEX."""
-        text = update.message.text.strip()
-        if not text.isdigit():
-            await update.message.reply_text("❌ Введите число от 1 до 31.")
+    async def gex_handle_day_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора дня месяца по кнопке (1–31) для пресета GEX."""
+        query = update.callback_query
+        await query.answer()
+        try:
+            day_num = int(query.data.replace("gex_day_", ""))
+        except ValueError:
             return GEX_ENTERING_DAY
-        day_num = int(text)
         if day_num < 1 or day_num > 31:
-            await update.message.reply_text("❌ День должен быть от 1 до 31.")
             return GEX_ENTERING_DAY
         context.user_data["gex_day"] = day_num
         keyboard = []
@@ -522,8 +537,9 @@ class TelegramOptionBot:
             keyboard.append([InlineKeyboardButton(month, callback_data=f"gex_month_{month}")])
         keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
+        await query.edit_message_text(
             f"📈 Экспирация: {context.user_data.get('gex_underlying')}, день {day_num}\n\nВыберите месяц экспирации:",
+            parse_mode='HTML',
             reply_markup=reply_markup
         )
         return GEX_CHOOSING_MONTH
@@ -946,6 +962,32 @@ class TelegramOptionBot:
             if oi_strike_png:
                 await context.bot.send_photo(chat_id=chat_id, photo=oi_strike_png, caption=f"OI по страйкам {underlying} {exp_str}")
                 sent += 1
+            # Улыбка волатильности (третья по счёту — после OI по страйкам)
+            now_local = datetime.now(DISPLAY_TIMEZONE)
+            two_hours_ago = (now_local - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
+            hour_ts_2h = two_hours_ago.strftime("%Y-%m-%d %H:00")
+            yesterday_date = (now_local.date() - timedelta(days=1))
+            yesterday_20_ts = f"{yesterday_date.isoformat()} 20:00"
+            snapshots_3h = self.db.get_option_snapshots_hourly(underlying, exp_str, hours=3)
+            snapshot_2h = snapshots_3h.get(hour_ts_2h) if snapshots_3h else None
+            exp_date = self.db.parse_expiration_date(exp_str.upper())
+            exp_prev = (exp_date - timedelta(days=1)) if exp_date else None
+            if exp_prev:
+                exp_str_prev = self.db.expiration_date_to_str(exp_prev)
+                snapshots_prev = self.db.get_option_snapshots_hourly(underlying, exp_str_prev, hours=48)
+                snapshot_yesterday = snapshots_prev.get(yesterday_20_ts) if snapshots_prev else None
+            else:
+                snapshot_yesterday = None
+            smile_png = build_volatility_smile_chart_png_three_series(
+                all_data, underlying, exp_str,
+                snapshot_2h_ago=snapshot_2h,
+                snapshot_yesterday=snapshot_yesterday,
+                label_2h="2 ч назад",
+                label_yesterday="Вчера 20:00",
+            )
+            if smile_png:
+                await context.bot.send_photo(chat_id=chat_id, photo=smile_png, caption=f"Улыбка волатильности {underlying} {exp_str}")
+                sent += 1
             # IV (ATM) по часам из снимков на границе часа; текущее IV_ATM — из текущей доски
             iv_series = self.db.get_iv_atm_hourly(underlying, exp_str, hours=24)
             current_iv = compute_iv_atm_from_board(all_data, underlying, exp_str)
@@ -965,31 +1007,20 @@ class TelegramOptionBot:
                 oi_png = build_oi_chart_png(oi_series, title=oi_title, current_oi=current_oi if current_oi else None)
                 await context.bot.send_photo(chat_id=chat_id, photo=oi_png, caption=oi_title + (f"  |  Текущее: {current_oi:,.0f}" if current_oi else ""))
                 sent += 1
-            # Улыбка волатильности: текущая + 2 ч назад + вчера 20:00 (экспирация на день раньше)
-            now_local = datetime.now(DISPLAY_TIMEZONE)
-            two_hours_ago = (now_local - timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
-            hour_ts_2h = two_hours_ago.strftime("%Y-%m-%d %H:00")
-            yesterday_date = (now_local.date() - timedelta(days=1))
-            yesterday_20_ts = f"{yesterday_date.isoformat()} 20:00"
-            snapshots_3h = self.db.get_option_snapshots_hourly(underlying, exp_str, hours=3)
-            snapshot_2h = snapshots_3h.get(hour_ts_2h) if snapshots_3h else None
-            exp_date = self.db.parse_expiration_date(exp_str.upper())
-            exp_prev = (exp_date - timedelta(days=1)) if exp_date else None
-            snapshot_yesterday = self.db.get_option_snapshot_at_hour(underlying, exp_prev, yesterday_20_ts) if exp_prev else None
-            smile_png = build_volatility_smile_chart_png_three_series(
-                all_data, underlying, exp_str,
-                snapshot_2h_ago=snapshot_2h,
-                snapshot_yesterday=snapshot_yesterday,
-                label_2h="2 ч назад",
-                label_yesterday="Вчера 20:00",
-            )
-            if smile_png:
-                await context.bot.send_photo(chat_id=chat_id, photo=smile_png, caption=f"Улыбка волатильности {underlying} {exp_str}")
-                sent += 1
         if query and sent == 0:
             await query.edit_message_text("📊 По экспирациям нет данных для расчёта (нет опционов в доске с DTE ≤ 3).")
-        elif query and sent > 0:
-            await query.edit_message_text(f"✅ Отправлено графиков: {sent}")
+        elif sent > 0:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu"),
+                    InlineKeyboardButton("🔄 Пересчитать индикаторы", callback_data="gex_calc"),
+                ]
+            ])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ Отправлено графиков: {sent}",
+                reply_markup=keyboard
+            )
         return CHOOSING_ACTION
 
     async def checklist_run(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1006,6 +1037,7 @@ class TelegramOptionBot:
                 await context.bot.send_message(chat_id=chat_id, text=text)
             return CHOOSING_ACTION
         all_data = data_store.get_all()
+        sent = 0
         for p in presets:
             underlying = p["underlying"]
             exp_str = p["expiration_str"]
@@ -1050,8 +1082,19 @@ class TelegramOptionBot:
                     lines.append("<i>(0–3 → пропуск; 4–6 → половинный размер; 7–9 → полный вход)</i>")
             text = "\n".join(lines)
             await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        if query and presets:
-            await query.edit_message_text("✅ Чек-лист отправлен по каждой экспирации.")
+            sent += 1
+        if sent > 0:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⬅️ Назад", callback_data="gex_menu"),
+                    InlineKeyboardButton("🔄 Пересчитать чек-лист", callback_data="checklist_run"),
+                ]
+            ])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="✅ Чек-лист отправлен по каждой экспирации.",
+                reply_markup=keyboard
+            )
         return CHOOSING_ACTION
 
     # ===== ДОБАВЛЕНИЕ ОПЦИОНА =====
@@ -1094,8 +1137,21 @@ class TelegramOptionBot:
 
         return CHOOSING_UNDERLYING
 
+    def _add_option_day_keyboard(self) -> InlineKeyboardMarkup:
+        """Клавиатура выбора дня месяца для добавления опциона: плитка 5×6 (1–30), затем 31 и «Назад»."""
+        keyboard = []
+        for row_start in range(1, 31, 5):
+            row = [
+                InlineKeyboardButton(str(d), callback_data=f"option_day_{d}")
+                for d in range(row_start, min(row_start + 5, 31))
+            ]
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("31", callback_data="option_day_31")])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="option_back_underlying")])
+        return InlineKeyboardMarkup(keyboard)
+
     async def handle_underlying_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка выбора базового актива"""
+        """Обработка выбора базового актива — показываем выбор дня месяца кнопками."""
         # Это всегда будет callback_query
         query = update.callback_query
         await query.answer()
@@ -1103,41 +1159,28 @@ class TelegramOptionBot:
         underlying = query.data.split("_")[1]
         context.user_data['underlying'] = underlying
 
+        reply_markup = self._add_option_day_keyboard()
         await query.edit_message_text(
             f"📊 *Добавление опциона*\n\n"
             f"Базовый актив: *{underlying}*\n\n"
-            f"Введите число месяца экспирации (от 1 до 31):\n"
-            f"*Пример:* 4, 15, 25",
-            parse_mode='Markdown'
+            f"Выберите число месяца экспирации:",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
         )
         return ENTERING_DAY
 
-    async def handle_day_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка ввода дня"""
-        text = update.message.text.strip()
-
-        # Проверяем формат - просто число без ведущих нулей
-        if not text.isdigit():
-            await update.message.reply_text(
-                "❌ Неверный формат. Введите число от 1 до 31:\n"
-                "*Пример:* 4, 15, 25",
-                parse_mode='Markdown'
-            )
+    async def handle_day_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора дня месяца по кнопке (1–31) при добавлении опциона."""
+        query = update.callback_query
+        await query.answer()
+        try:
+            day_num = int(query.data.replace("option_day_", ""))
+        except ValueError:
             return ENTERING_DAY
-
-        day_num = int(text)
         if day_num < 1 or day_num > 31:
-            await update.message.reply_text(
-                "❌ Число должно быть от 1 до 31:\n"
-                "*Пример:* 4, 15, 25",
-                parse_mode='Markdown'
-            )
             return ENTERING_DAY
-
-        # Сохраняем как строку без ведущих нулей
         context.user_data['day'] = str(day_num)
 
-        # Создаем клавиатуру с месяцами
         keyboard = []
         row = []
         for i, month in enumerate(MONTHS, 1):
@@ -1148,10 +1191,9 @@ class TelegramOptionBot:
         if row:
             keyboard.append(row)
         keyboard.append([InlineKeyboardButton(CANCEL_TEXT, callback_data="cancel")])
-
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.reply_text(
+        await query.edit_message_text(
             f"📊 *Добавление опциона*\n\n"
             f"Базовый актив: *{context.user_data['underlying']}*\n"
             f"День: *{context.user_data['day']}*\n\n"
@@ -1160,6 +1202,21 @@ class TelegramOptionBot:
             reply_markup=reply_markup
         )
         return CHOOSING_MONTH
+
+    async def handle_back_to_underlying(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Возврат к выбору базового актива при добавлении опциона."""
+        query = update.callback_query
+        await query.answer()
+        keyboard = []
+        for asset in UNDERLYING_ASSETS:
+            keyboard.append([InlineKeyboardButton(asset, callback_data=f"underlying_{asset}")])
+        keyboard.append([InlineKeyboardButton(CANCEL_TEXT, callback_data="cancel")])
+        await query.edit_message_text(
+            "📊 *Добавление опциона*\n\nВыберите базовый актив:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return CHOOSING_UNDERLYING
 
     async def handle_month_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка выбора месяца"""
@@ -2942,7 +2999,9 @@ class TelegramOptionBot:
                     CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$")
                 ],
                 ENTERING_DAY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_day_input)
+                    CallbackQueryHandler(self.handle_day_selection, pattern="^option_day_"),
+                    CallbackQueryHandler(self.handle_back_to_underlying, pattern="^option_back_underlying$"),
+                    CallbackQueryHandler(self.cancel_operation, pattern="^cancel$")
                 ],
                 CHOOSING_MONTH: [
                     CallbackQueryHandler(self.handle_month_selection, pattern="^month_"),
@@ -3064,7 +3123,8 @@ class TelegramOptionBot:
                     CallbackQueryHandler(self.gex_show_menu, pattern="^gex_menu$")
                 ],
                 GEX_ENTERING_DAY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, self.gex_handle_day_input)
+                    CallbackQueryHandler(self.gex_handle_day_selection, pattern="^gex_day_"),
+                    CallbackQueryHandler(self.gex_show_menu, pattern="^gex_menu$")
                 ],
                 GEX_CHOOSING_MONTH: [
                     CallbackQueryHandler(self.gex_handle_month, pattern="^gex_month_"),
