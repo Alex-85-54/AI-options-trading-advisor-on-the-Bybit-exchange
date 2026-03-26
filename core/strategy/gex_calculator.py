@@ -18,6 +18,25 @@ GEX_MAX_DTE = 5
 CHART_HALF_SPAN = 7500
 
 
+def _xlim_from_strikes_and_spot(
+    strikes: Sequence[float],
+    underlying_price: Optional[float],
+    step: float = 500,
+) -> Tuple[float, float]:
+    """
+    Границы оси X по данным (страйки + спот) с отступом, чтобы график не был «скомкан».
+    """
+    if not strikes:
+        return (0.0, 1.0)
+    lo = min(strikes)
+    hi = max(strikes)
+    if underlying_price is not None:
+        lo = min(lo, underlying_price)
+        hi = max(hi, underlying_price)
+    padding = step
+    return (lo - padding, hi + padding)
+
+
 def _parse_symbol(symbol: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
     """Извлечь (underlying, expiry_str, strike) из символа. expiry_str например 4JAN26."""
     try:
@@ -296,8 +315,13 @@ def build_gex_chart_png(
     strikes = _strikes_centered_on_spot(strikes, underlying_price)
     values = [gex_by_strike[s] for s in strikes]
     colors = ['#2ecc71' if v >= 0 else '#e74c3c' for v in values]
-    step = (strikes[1] - strikes[0]) if len(strikes) > 1 else 500
-    bar_width = step * 0.85
+    # Минимальный шаг между страйками, чтобы столбцы не наезжали при смешанных интервалах (500 и 1000)
+    if len(strikes) > 1:
+        min_step = min(strikes[i + 1] - strikes[i] for i in range(len(strikes) - 1))
+        step = min_step
+    else:
+        min_step = step = 500
+    bar_width = min_step * 0.85
 
     fig, ax = plt.subplots(figsize=(12, 6))
     bars = ax.bar(strikes, values, width=bar_width, color=colors, edgecolor='gray', linewidth=0.5)
@@ -331,8 +355,8 @@ def build_gex_chart_png(
         legend_handles.insert(0, Line2D([0], [0], color='blue', linestyle='--', linewidth=2, label=f'Spot ~{underlying_price:,.0f}'))
     if legend_handles:
         ax.legend(handles=legend_handles, loc='upper right', fontsize=8)
-    if underlying_price is not None:
-        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
+    x_min, x_max = _xlim_from_strikes_and_spot(strikes, underlying_price, step)
+    ax.set_xlim(x_min, x_max)
     ax.set_xticks(strikes)
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('GEX')
@@ -396,17 +420,22 @@ def build_oi_by_strike_chart_png(
 
     oi_calls = [oi_call.get(s, 0) for s in strikes]
     oi_puts = [oi_put.get(s, 0) for s in strikes]
-    step = (strikes[1] - strikes[0]) if len(strikes) > 1 else 500
-    bar_half = step * 0.2  # сдвиг пары столбцов от центра страйка
-    bar_width = step * 0.4
+    # Минимальный шаг между страйками — ширина и сдвиг столбцов от него, чтобы не наезжали
+    if len(strikes) > 1:
+        min_step = min(strikes[i + 1] - strikes[i] for i in range(len(strikes) - 1))
+        step = min_step
+    else:
+        min_step = step = 500
+    bar_half = min_step * 0.15  # сдвиг пары столбцов от центра страйка
+    bar_width = min_step * 0.3   # ширина одного столбца (Calls/Puts), чтобы пара не выходила за интервал
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.bar([s - bar_half for s in strikes], oi_calls, bar_width, label='Calls', color='#3498db', edgecolor='gray', linewidth=0.5)
     ax.bar([s + bar_half for s in strikes], oi_puts, bar_width, label='Puts', color='#e74c3c', edgecolor='gray', linewidth=0.5)
     if underlying_price is not None and strikes:
         ax.axvline(x=underlying_price, color='gray', linestyle='--', linewidth=1.2, alpha=0.8, label=f'Spot ~{underlying_price:,.0f}')
-    if underlying_price is not None:
-        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
+    x_min, x_max = _xlim_from_strikes_and_spot(strikes, underlying_price, step)
+    ax.set_xlim(x_min, x_max)
     ax.set_xticks(strikes)
     ax.set_xticklabels([f'{s:,.0f}' for s in strikes], rotation=45, ha='right', fontsize=8)
     ax.set_ylabel('Open Interest')
@@ -706,8 +735,10 @@ def build_volatility_smile_chart_png(
 
     if underlying_price is not None:
         ax.axvline(x=underlying_price, color="gray", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ~{underlying_price:,.0f}")
-    if underlying_price is not None:
-        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
+    strikes_visible = sorted(strike_window)
+    step_s = (strikes_visible[1] - strikes_visible[0]) if len(strikes_visible) > 1 else 500
+    x_min, x_max = _xlim_from_strikes_and_spot(strikes_visible, underlying_price, step_s)
+    ax.set_xlim(x_min, x_max)
 
     ax.set_xlabel("Страйк")
     ax.set_ylabel("IV")
@@ -848,8 +879,10 @@ def build_volatility_smile_chart_png_three_series(
         ax.axvline(x=spot_2h, color="#e67e22", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ({label_2h}) ~{spot_2h:,.0f}")
     if spot_yest is not None:
         ax.axvline(x=spot_yest, color="#1abc9c", linestyle="--", linewidth=1.2, alpha=0.8, label=f"Spot ({label_yesterday}) ~{spot_yest:,.0f}")
-    if underlying_price is not None:
-        ax.set_xlim(underlying_price - CHART_HALF_SPAN, underlying_price + CHART_HALF_SPAN)
+    strikes_visible = sorted(strike_window)
+    step_s = (strikes_visible[1] - strikes_visible[0]) if len(strikes_visible) > 1 else 500
+    x_min, x_max = _xlim_from_strikes_and_spot(strikes_visible, underlying_price, step_s)
+    ax.set_xlim(x_min, x_max)
 
     ax.set_xlabel("Страйк")
     ax.set_ylabel("IV")

@@ -43,6 +43,7 @@ from utils.log_buffer import get_log_buffer_handler
 import logging
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import threading
 
 # Настройка логирования: читаемый формат с временем и описанием на русском
@@ -111,6 +112,7 @@ dynamic_thresholds = DynamicThresholds()
 subscription_scheduler = AsyncIOScheduler(timezone=DISPLAY_TIMEZONE)
 last_subscription_refresh: Optional[datetime] = None
 next_subscription_run: Optional[datetime] = None
+last_subscription_spot_by_underlying: Dict[str, float] = {}
 subscription_lock = threading.Lock()
 
 
@@ -131,9 +133,16 @@ def refresh_option_subscriptions() -> Dict[str, int]:
         all_symbols: List[str] = []
         max_days = SUBSCRIPTION_CONFIG.get("max_expiration_days", 3)
 
+        global last_subscription_spot_by_underlying
         for underlying in UNDERLYING_ASSETS:
             board_data = option_board.get_option_board(underlying, max_days=max_days)
             symbols = board_data.get("symbols", [])
+            up = board_data.get("underlying_price")
+            if up is not None:
+                try:
+                    last_subscription_spot_by_underlying[underlying] = float(up)
+                except (TypeError, ValueError):
+                    pass
             if symbols:
                 all_symbols.extend(symbols)
                 logger.info("Переподписка: по активу %s найдено символов — %s", underlying, len(symbols))
@@ -190,6 +199,38 @@ async def refresh_option_subscriptions_async() -> Dict[str, int]:
         return {"old_count": 0, "new_count": 0, "timeout": True}
 
 
+async def check_drift_and_resubscribe_async() -> None:
+    """
+    Проверка сдвига цены спота относительно цены при последней подписке.
+    Если сдвиг >= price_drift_steps_trigger шагов — запуск переподписки.
+    Вызывается только по таймеру (каждые 10 мин), не при запросе «Рассчитать индикаторы».
+    """
+    strike_step = SUBSCRIPTION_CONFIG.get("strike_step_3days", 500)
+    drift_trigger = SUBSCRIPTION_CONFIG.get("price_drift_steps_trigger", 5)
+    for underlying in UNDERLYING_ASSETS:
+        by_sym = data_store.get_by_underlying(underlying)
+        current_spot = None
+        for _sym, data in by_sym.items():
+            p = data.get("underlying_price")
+            if p is not None:
+                try:
+                    current_spot = float(p)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        last_spot = last_subscription_spot_by_underlying.get(underlying)
+        if current_spot is None or last_spot is None:
+            continue
+        drift_steps = abs(current_spot - last_spot) / strike_step
+        if drift_steps >= drift_trigger:
+            logger.info(
+                "Сдвиг цены %s: %.1f шагов (порог %s), запуск переподписки",
+                underlying, drift_steps, drift_trigger,
+            )
+            await refresh_option_subscriptions_async()
+            return
+
+
 @app.on_event("startup")
 async def startup_event():
     """Запуск планировщика переподписки"""
@@ -216,6 +257,14 @@ async def startup_event():
         global next_subscription_run
         next_subscription_run = job.next_run_time
         logger.info("Следующая переподписка по расписанию: %s", next_subscription_run)
+        subscription_scheduler.add_job(
+            check_drift_and_resubscribe_async,
+            trigger=IntervalTrigger(minutes=10),
+            id="drift_check_resubscribe",
+            replace_existing=True,
+            max_instances=1,
+        )
+        logger.info("Проверка сдвига цены (переподписка при сдвиге >= %s шагов): каждые 10 мин", SUBSCRIPTION_CONFIG.get("price_drift_steps_trigger", 5))
     # Первичная подписка при старте, чтобы админ-панель сразу показывала актуальные данные
     await refresh_option_subscriptions_async()
 
