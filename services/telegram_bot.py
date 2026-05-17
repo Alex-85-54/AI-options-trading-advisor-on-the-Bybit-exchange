@@ -19,9 +19,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG, format_datetime_local, DISPLAY_TIMEZONE
-from services.websocket_manager import ws_manager
 from services.data_store import data_store
-from core.data.option_board import get_option_board
 from core.data.database import get_database
 from core.agent.decision_engine import get_decision_engine
 from core.agent.trading_agent import get_trading_agent
@@ -71,6 +69,8 @@ else:
 # локально по умолчанию используется localhost.
 import os
 MONITORING_SERVICE_URL = os.getenv("MONITORING_SERVICE_URL", "http://localhost:8001")
+API_SERVER_URL = os.getenv("API_SERVER_URL", "http://api-server:7000")
+LIVE_DATA_MAX_AGE_SECONDS = int(os.getenv("LIVE_DATA_MAX_AGE_SECONDS", "180"))
 THRESHOLD = 0.01  # Порог равенства цен (1%)
 CHECK_INTERVAL = 5  # Интервал проверки в секундах
 
@@ -129,14 +129,94 @@ class TelegramOptionBot:
         self.user_monitoring: Dict[int, bool] = {}
         self.user_jobs: Dict[int, JobQueue] = {}
         self.pair_status: Dict[int, Dict[Tuple[str, str], bool]] = {}
-        self.option_board = get_option_board()
-        
         # Состояние агента
         self.agent_enabled: Dict[int, bool] = {}  # Для каждого пользователя отдельно
         self.agent_decision_engine = get_decision_engine(data_store=data_store)
         self.agent_last_run: Dict[int, Optional[datetime]] = {}
         self.agent_last_signal: Dict[int, Optional[Dict]] = {}
         self.db = get_database()
+
+    def _create_option_symbol(
+        self,
+        underlying: str,
+        day: str,
+        month: str,
+        strike: str,
+        option_type: str,
+    ) -> str:
+        year = CONFIG["expiration_year"]
+        return f"{underlying}-{day}{month}{year}-{strike}-{option_type}-USDT"
+
+    def _subscribe_symbols_via_api(self, symbols: List[str]) -> None:
+        """Единый источник WS: подписками управляет только api-server."""
+        try:
+            requests.post(
+                f"{API_SERVER_URL}/subscriptions/update",
+                json=symbols,
+                timeout=8,
+            )
+        except Exception as e:
+            logger.error("Не удалось обновить подписки через api-server: %s", e)
+
+    def _fetch_live_data(self, underlyings: List[str]) -> Dict[str, Dict]:
+        """Получить текущую доску опционов из api-server (а не из локального data_store бота)."""
+        merged: Dict[str, Dict] = {}
+        for underlying in sorted(set(underlyings)):
+            try:
+                resp = requests.get(f"{API_SERVER_URL}/data/underlying/{underlying}", timeout=8)
+                if resp.status_code != 200:
+                    logger.warning("api-server /data/underlying/%s -> %s", underlying, resp.status_code)
+                    continue
+                payload = resp.json() if resp.content else {}
+                opts = payload.get("options") if isinstance(payload, dict) else None
+                if isinstance(opts, dict):
+                    merged.update(opts)
+            except Exception as e:
+                logger.error("Ошибка запроса live-данных %s из api-server: %s", underlying, e)
+        return merged
+
+    def _latest_timestamp_for_prefix(self, data: Dict[str, Dict], prefix: str) -> Optional[datetime]:
+        """Вернуть максимальный timestamp по символам префикса."""
+        best: Optional[datetime] = None
+        for sym, row in data.items():
+            if not sym.startswith(prefix):
+                continue
+            ts = row.get("timestamp")
+            if not ts:
+                continue
+            dt: Optional[datetime] = None
+            if isinstance(ts, datetime):
+                dt = ts
+            elif isinstance(ts, str):
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except ValueError:
+                    dt = None
+            if dt is None:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=DISPLAY_TIMEZONE)
+            if best is None or dt > best:
+                best = dt
+        return best
+
+    def _is_live_data_fresh(self, data: Dict[str, Dict], underlying: str, exp_str: str) -> bool:
+        prefix = f"{underlying}-{exp_str}-"
+        ts = self._latest_timestamp_for_prefix(data, prefix)
+        if ts is None:
+            return False
+        age = (datetime.now(DISPLAY_TIMEZONE) - ts.astimezone(DISPLAY_TIMEZONE)).total_seconds()
+        return age <= LIVE_DATA_MAX_AGE_SECONDS
+
+    def _live_data_staleness_info(self, data: Dict[str, Dict], underlying: str, exp_str: str) -> str:
+        """Текст с фактическим временем последнего обновления и возрастом данных."""
+        prefix = f"{underlying}-{exp_str}-"
+        ts = self._latest_timestamp_for_prefix(data, prefix)
+        if ts is None:
+            return "Последний timestamp: нет данных."
+        ts_local = ts.astimezone(DISPLAY_TIMEZONE)
+        age_sec = int((datetime.now(DISPLAY_TIMEZONE) - ts_local).total_seconds())
+        return f"Последний timestamp: {format_datetime_local(ts_local)} (возраст: {age_sec} сек)."
 
     def _get_user_info(self, update: Update):
         """Универсальный метод для получения информации о пользователе из update"""
@@ -762,9 +842,12 @@ class TelegramOptionBot:
             else:
                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=keyboard)
             return GEX_MONITOR_MENU
-        all_data = data_store.get_all()
+        underlyings = [p["underlying"] for p in presets]
+        all_data = self._fetch_live_data(underlyings)
         exceeded_expirations = []
         for p in presets:
+            if not self._is_live_data_fresh(all_data, p["underlying"], p["expiration_str"]):
+                continue
             opts = options_from_datastore_for_gex(all_data, p["underlying"], p["expiration_str"])
             if not opts:
                 continue
@@ -881,9 +964,12 @@ class TelegramOptionBot:
         presets = self.db.get_gex_presets(user_id)
         if not presets:
             return
-        all_data = data_store.get_all()
+        underlyings = [p["underlying"] for p in presets]
+        all_data = self._fetch_live_data(underlyings)
         exceeded = []
         for p in presets:
+            if not self._is_live_data_fresh(all_data, p["underlying"], p["expiration_str"]):
+                continue
             opts = options_from_datastore_for_gex(all_data, p["underlying"], p["expiration_str"])
             if not opts:
                 continue
@@ -929,11 +1015,28 @@ class TelegramOptionBot:
                     text="📊 Нет экспираций. Добавьте экспирацию, затем нажмите «Рассчитать индикаторы»."
                 )
             return CHOOSING_ACTION
-        all_data = data_store.get_all()
+        underlyings = [p["underlying"] for p in presets]
+        all_data = self._fetch_live_data(underlyings)
+        if not all_data:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Нет текущих данных с WebSocket (api-server). Проверьте сервис api-server и переподписку.",
+            )
+            return CHOOSING_ACTION
         sent = 0
         for p in presets:
             underlying = p["underlying"]
             exp_str = p["expiration_str"]
+            if not self._is_live_data_fresh(all_data, underlying, exp_str):
+                stale_info = self._live_data_staleness_info(all_data, underlying, exp_str)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ {underlying} {exp_str}: текущие данные устарели или отсутствуют "
+                        f"(старше {LIVE_DATA_MAX_AGE_SECONDS} сек).\n{stale_info}"
+                    ),
+                )
+                continue
             opts = options_from_datastore_for_gex(all_data, underlying, exp_str)
             if not opts:
                 await context.bot.send_message(
@@ -1036,12 +1139,29 @@ class TelegramOptionBot:
             else:
                 await context.bot.send_message(chat_id=chat_id, text=text)
             return CHOOSING_ACTION
-        all_data = data_store.get_all()
+        underlyings = [p["underlying"] for p in presets]
+        all_data = self._fetch_live_data(underlyings)
+        if not all_data:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Нет текущих данных с WebSocket (api-server). Проверьте сервис api-server и переподписку.",
+            )
+            return CHOOSING_ACTION
         sent = 0
         for p in presets:
             underlying = p["underlying"]
             exp_str = p["expiration_str"]
             prefix = f"{underlying}-{exp_str}-"
+            if not self._is_live_data_fresh(all_data, underlying, exp_str):
+                stale_info = self._live_data_staleness_info(all_data, underlying, exp_str)
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ {underlying} {exp_str}: текущие данные устарели или отсутствуют "
+                        f"(старше {LIVE_DATA_MAX_AGE_SECONDS} сек).\n{stale_info}"
+                    ),
+                )
+                continue
             if not any(s.startswith(prefix) for s in all_data.keys()):
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -1313,9 +1433,9 @@ class TelegramOptionBot:
             )
             return ConversationHandler.END
 
-        # Создаем символ опциона через менеджер WebSocket
+        # Создаем символ опциона (формат Bybit)
         try:
-            symbol = ws_manager.create_option_symbol(
+            symbol = self._create_option_symbol(
                 context.user_data['underlying'],
                 context.user_data['day'],
                 context.user_data['month'],
@@ -1361,14 +1481,8 @@ class TelegramOptionBot:
 
 
 
-        # Подписываемся на обновления
-        try:
-            ws_manager.connect([symbol])
-        except Exception as e:
-            print(f"ws_manager type: {type(ws_manager)}")
-            print(f"ws_manager methods: {dir(ws_manager)}")
-            logger.error(f"Error connecting to WebSocket: {e}")
-            # Но продолжаем, так как опцион все равно добавлен
+        # Подписку обновляет api-server (единый источник WebSocket)
+        self._subscribe_symbols_via_api([symbol])
 
         keyboard = [[InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2934,53 +3048,10 @@ class TelegramOptionBot:
     
     def _auto_subscribe_on_startup(self):
         """
-        Автоматическая подписка на опционы при старте приложения
-        
-        Получает список доступных экспираций для базовых активов (BTC, ETH, SOL)
-        и подписывается на опционы через WebSocket согласно конфигурации.
+        В боте подписка на WS не выполняется:
+        единственный источник WebSocket — api-server.
         """
-        logger.info("🔄 Начинаю автоматическую подписку на опционы при старте...")
-        
-        max_days = SUBSCRIPTION_CONFIG.get("max_expiration_days", 3)
-        underlying_assets = UNDERLYING_ASSETS  # ["BTC", "ETH", "SOL"]
-        
-        all_symbols = []
-        
-        for underlying in underlying_assets:
-            try:
-                logger.info(f"📊 Получение доски опционов для {underlying}...")
-                board_data = self.option_board.get_option_board(underlying, max_days=max_days)
-                
-                symbols = board_data.get('symbols', [])
-                expirations = board_data.get('expirations', [])
-                underlying_price = board_data.get('underlying_price')
-                
-                if not symbols:
-                    logger.warning(f"⚠️ Не найдено опционов для {underlying}")
-                    continue
-                
-                logger.info(
-                    f"✅ Найдено {len(symbols)} опционов для {underlying}: "
-                    f"{len(expirations)} экспираций, цена: {underlying_price}"
-                )
-                
-                all_symbols.extend(symbols)
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка при получении опционов для {underlying}: {e}", exc_info=True)
-                continue
-        
-        if not all_symbols:
-            logger.warning("⚠️ Не найдено опционов для автоматической подписки")
-            return
-        
-        # Подписываемся на все найденные опционы
-        try:
-            logger.info(f"🔌 Подписка на {len(all_symbols)} опционов через WebSocket...")
-            ws_manager.connect(all_symbols, wait_for_data=False)
-            logger.info(f"✅ Автоматическая подписка завершена: {len(all_symbols)} опционов")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при подписке на опционы: {e}", exc_info=True)
+        logger.info("WS в telegram-bot отключён: используем live-данные только из api-server")
 
     def run(self):
         """Запуск бота"""
@@ -3189,9 +3260,6 @@ class TelegramOptionBot:
             ])
         application.post_init = set_bot_commands
 
-        # Автоматическая подписка на опционы при старте
-        self._auto_subscribe_on_startup()
-        
         # Запускаем бота
         logger.info("Бот запущен...")
         application.run_polling(

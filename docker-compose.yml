@@ -13,6 +13,8 @@ services:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
       # URL сервиса мониторинга внутри сети Docker
       MONITORING_SERVICE_URL: "http://monitoring-service:8001"
+      # Единый источник текущих WS-данных для бота
+      API_SERVER_URL: "http://api-server:7000"
     volumes:
       # Монтируем директорию data для доступа к БД извне контейнера
       - ./data:/app/data

@@ -25,3 +25,9 @@ data/*.db
 .coverage
 ./.env
 .env
+
+CHECK_ADMIN.sh
+check_env.sh
+monitoring_service.log
+option_history.csv
+trading_bot.log
