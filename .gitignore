@@ -1,33 +1,66 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
 # Logs
 logs/*.log
 logs/*.log.*
 !logs/.gitkeep
-
-# Старые файлы логов (если были)
 *.log
 monitoring_service.log
 trading_bot.log
-__pycache__/config.cpython-312.pyc
-# Python cache
-__pycache__/
 
-*.py[cod]
-*$py.class
-*.pyc
-
-# Database files
+# Database and runtime data
 *.db
 *.sqlite
 *.sqlite3
 data/*.db
+!data/.gitkeep
 
-.cursorrulles
-.coverage
-./.env
-.env
+# Local datasets and exports (not for public repo)
+geted_data/
+geted_data.zip
+*.csv
+!tests/**/*.csv
 
+# Jupyter
+.ipynb_checkpoints/
+testing.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific local scripts (may contain paths/secrets)
 CHECK_ADMIN.sh
 check_env.sh
-monitoring_service.log
-option_history.csv
-trading_bot.log
+test_env_in_container.sh
+
+# Cursor local rules typo file
+.cursorrulles
