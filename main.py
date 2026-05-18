@@ -20,8 +20,8 @@ sys.path.insert(0, str(project_root))
 
 from utils.logging_config import setup_service_logging
 
-# Настройка логирования с ротацией файлов
-logger = setup_service_logging(service_name="monitoring_service", log_level=logging.INFO)
+# Уровень и параметры берутся из LOGGING_CONFIG (config.py)
+logger = setup_service_logging(service_name="monitoring_service")
 
 # Базовый URL API берём из переменной окружения (для Docker),
 # локально по умолчанию используется localhost.

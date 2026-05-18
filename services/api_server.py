@@ -46,13 +46,12 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import threading
 
-# Настройка логирования: читаемый формат с временем и описанием на русском
+# Настройка логирования: уровень и параметры берутся из LOGGING_CONFIG (config.py).
 print("Setting up logging...", flush=True)
 _log_format = "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"
 _log_datefmt = "%Y-%m-%d %H:%M:%S"
 logger = _setup_logging_base(
     service_name="api_server",
-    log_level=logging.INFO,
     format_string=_log_format,
 )
 # Устанавливаем формат даты/времени для всех хендлеров api_server

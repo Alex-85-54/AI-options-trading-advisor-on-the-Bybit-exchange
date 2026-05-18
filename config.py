@@ -111,7 +111,7 @@ _deepseek_api_key = os.getenv("DEEPSEEK_API_KEY", "").strip().strip('"').strip("
 AGENT_CONFIG = {
     "run_interval_minutes": 60,            # Частота запуска агента (каждый час)
     "run_at_hour_start": True,             # Запускать в начале каждого часа (10:00, 11:00, ...)
-    "max_expiration_days": 3,              # Максимальная экспирация для анализа 
+    "max_expiration_days": 3,              # Агент/LLM: только DTE 1..N (сбор данных — SUBSCRIPTION_CONFIG) 
     "min_confidence": 0.5,                 # Минимальная уверенность для сигнала
     "deepseek_api_key": _deepseek_api_key,
     "deepseek_model": "deepseek-chat",
@@ -122,6 +122,62 @@ AGENT_CONFIG = {
     "api_retry_delay_seconds": 2,          # Начальная задержка между попытками (секунды)
     "api_timeout_seconds": 30,            # Таймаут для API запросов (секунды)
     "skip_on_api_error": True,            # Пропускать цикл при недоступности API (не падать)
+}
+
+
+# Конфигурация логирования
+# Уровень можно переопределить через переменную окружения LOG_LEVEL.
+# Уровни: DEBUG (подробно), INFO (рекомендуется), WARNING (только предупреждения и ошибки),
+# ERROR (только ошибки), CRITICAL.
+LOGGING_CONFIG = {
+    # Глобальный порог логирования для всех сервисов
+    "level": os.getenv("LOG_LEVEL", "INFO").upper(),
+    # Размер файла лога в МБ до ротации (раньше было 100, уменьшаем)
+    "max_file_size_mb": int(os.getenv("LOG_MAX_FILE_SIZE_MB", "20")),
+    # Сколько архивных копий хранить
+    "backup_count": int(os.getenv("LOG_BACKUP_COUNT", "3")),
+    # Подавление шумных сторонних библиотек (httpcore/httpx/telegram debug)
+    "noisy_loggers": {
+        "httpcore": "WARNING",
+        "httpcore.http11": "WARNING",
+        "httpcore.connection": "WARNING",
+        "httpx": "WARNING",
+        "telegram.ext.ExtBot": "WARNING",
+        "telegram.bot": "WARNING",
+        "telegram.request": "WARNING",
+        "telegram.ext.Application": "INFO",
+        "apscheduler": "WARNING",
+        "apscheduler.executors.default": "WARNING",
+        "apscheduler.scheduler": "WARNING",
+        "websockets": "WARNING",
+        "websockets.client": "WARNING",
+        "websockets.protocol": "WARNING",
+        "uvicorn.access": "WARNING",
+        "urllib3": "WARNING",
+        "asyncio": "WARNING",
+        "matplotlib": "WARNING",
+        "PIL": "WARNING",
+    },
+}
+
+
+# Конфигурация Telegram-бота: режим работы (polling / webhook)
+# Polling работает «из коробки» без публичного домена, webhook — для production за HTTPS.
+BOT_CONFIG = {
+    # "polling" или "webhook"
+    "mode": os.getenv("BOT_MODE", "polling").lower(),
+    # Публичный URL бота (https). Пример: https://bot.example.com
+    "webhook_url": os.getenv("WEBHOOK_URL", "").rstrip("/"),
+    # Путь, по которому Telegram будет POST'ить апдейты. Сделайте «секретным».
+    "webhook_path": os.getenv("WEBHOOK_PATH", "/telegram-webhook"),
+    # Адрес, на котором слушает контейнер бота
+    "webhook_listen": os.getenv("WEBHOOK_LISTEN", "0.0.0.0"),
+    # Порт внутри контейнера (за reverse proxy / nginx)
+    "webhook_port": int(os.getenv("WEBHOOK_PORT", "8443")),
+    # Секретный заголовок X-Telegram-Bot-Api-Secret-Token (рекомендуется)
+    "webhook_secret_token": os.getenv("WEBHOOK_SECRET_TOKEN", ""),
+    # Сбрасывать ли «зависшие» апдейты при старте
+    "drop_pending_updates": os.getenv("BOT_DROP_PENDING_UPDATES", "true").lower() == "true",
 }
 
 

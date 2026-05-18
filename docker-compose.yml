@@ -15,6 +15,21 @@ services:
       MONITORING_SERVICE_URL: "http://monitoring-service:8001"
       # Единый источник текущих WS-данных для бота
       API_SERVER_URL: "http://api-server:7000"
+      # Логирование (см. config.LOGGING_CONFIG)
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_MAX_FILE_SIZE_MB: "${LOG_MAX_FILE_SIZE_MB:-20}"
+      LOG_BACKUP_COUNT: "${LOG_BACKUP_COUNT:-3}"
+      # Режим работы Telegram-бота: polling | webhook
+      BOT_MODE: "${BOT_MODE:-polling}"
+      WEBHOOK_URL: "${WEBHOOK_URL:-}"
+      WEBHOOK_PATH: "${WEBHOOK_PATH:-/telegram-webhook}"
+      WEBHOOK_LISTEN: "${WEBHOOK_LISTEN:-0.0.0.0}"
+      WEBHOOK_PORT: "${WEBHOOK_PORT:-8443}"
+      WEBHOOK_SECRET_TOKEN: "${WEBHOOK_SECRET_TOKEN:-}"
+      BOT_DROP_PENDING_UPDATES: "${BOT_DROP_PENDING_UPDATES:-true}"
+    ports:
+      # Порт webhook (используется только при BOT_MODE=webhook за reverse proxy)
+      - "${WEBHOOK_PORT:-8443}:${WEBHOOK_PORT:-8443}"
     volumes:
       # Монтируем директорию data для доступа к БД извне контейнера
       - ./data:/app/data
@@ -29,6 +44,9 @@ services:
     command: ["uv", "run", "uvicorn", "services.api_server:app", "--host", "0.0.0.0", "--port", "7000", "--log-level", "info"]
     environment:
       PYTHONUNBUFFERED: "1"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_MAX_FILE_SIZE_MB: "${LOG_MAX_FILE_SIZE_MB:-20}"
+      LOG_BACKUP_COUNT: "${LOG_BACKUP_COUNT:-3}"
     ports:
       - "8000:7000"  # Хост:Контейнер - сервер внутри контейнера слушает на 7000
     volumes:
@@ -51,6 +69,9 @@ services:
       PYTHONUNBUFFERED: "1"
       # Внутри Docker monitoring-service ходит в api-server по имени сервиса
       API_BASE_URL: "http://api-server:8000"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_MAX_FILE_SIZE_MB: "${LOG_MAX_FILE_SIZE_MB:-20}"
+      LOG_BACKUP_COUNT: "${LOG_BACKUP_COUNT:-3}"
     ports:
       - "8001:8001"
     volumes:

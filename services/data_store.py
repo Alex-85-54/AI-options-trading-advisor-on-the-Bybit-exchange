@@ -2,6 +2,7 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import threading
 import logging
+import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 
@@ -10,6 +11,69 @@ from core.data.option_board import is_otm
 from config import DISPLAY_TIMEZONE, SUBSCRIPTION_CONFIG
 
 logger = logging.getLogger(__name__)
+
+
+class RemoteDataStore:
+    """
+    HTTP-клиент к api-server, повторяющий интерфейс OptionDataStore.
+
+    Каждый вызов get/get_by_underlying — свежий запрос к api-server.
+    Используется в telegram-bot, чтобы агент видел WebSocket-данные,
+    которые накапливаются в api-server (а не в локальной памяти контейнера бота).
+    """
+
+    def __init__(self, api_server_url: str, timeout: float = 8.0):
+        self._url = api_server_url.rstrip("/")
+        self._timeout = timeout
+
+    def get(self, symbol: str) -> Optional[Dict]:
+        try:
+            resp = requests.get(
+                f"{self._url}/data/{symbol}",
+                timeout=self._timeout,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if isinstance(data, dict) and data.get("status") == "subscribed":
+                return None
+            return data
+        except Exception as exc:
+            logger.warning("RemoteDataStore.get(%s) failed: %s", symbol, exc)
+            return None
+
+    def get_by_underlying(self, underlying: str) -> Dict[str, Dict]:
+        try:
+            resp = requests.get(
+                f"{self._url}/data/underlying/{underlying}",
+                timeout=self._timeout,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "RemoteDataStore.get_by_underlying(%s) -> %s",
+                    underlying,
+                    resp.status_code,
+                )
+                return {}
+            payload = resp.json() if resp.content else {}
+            options = payload.get("options") if isinstance(payload, dict) else None
+            return options if isinstance(options, dict) else {}
+        except Exception as exc:
+            logger.warning(
+                "RemoteDataStore.get_by_underlying(%s) failed: %s",
+                underlying,
+                exc,
+            )
+            return {}
+
+    def get_all(self) -> Dict[str, Dict]:
+        return self.get_by_underlying("")
+
+    def update(self, *args, **kwargs) -> None:
+        raise NotImplementedError("RemoteDataStore — read-only")
+
+    def subscribe(self, *args, **kwargs) -> None:
+        raise NotImplementedError("RemoteDataStore — read-only")
 
 
 class OptionDataStore:

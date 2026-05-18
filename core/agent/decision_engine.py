@@ -41,6 +41,25 @@ class DecisionEngine:
         
         self.max_expiration_days = AGENT_CONFIG.get("max_expiration_days", 3)
         self.enable_signal_history = AGENT_CONFIG.get("enable_signal_history", True)
+
+    def _get_days_to_expiration_from_symbol(self, symbol: str) -> Optional[int]:
+        """DTE по тикеру Bybit (например BTC-4JAN26-89000-C-USDT)."""
+        parts = symbol.split("-")
+        if len(parts) < 2:
+            return None
+        expiration_date = parse_expiration_date(parts[1])
+        if expiration_date is None:
+            expiration_date = self.db.parse_expiration_date(parts[1])
+        if expiration_date is None:
+            return None
+        return (expiration_date - date.today()).days
+
+    def _symbol_passes_agent_expiration_filter(self, symbol: str) -> bool:
+        """Агент анализирует только 1..max_expiration_days (AGENT_CONFIG)."""
+        dte = self._get_days_to_expiration_from_symbol(symbol)
+        if dte is None or dte <= 0:
+            return False
+        return dte <= self.max_expiration_days
     
     def collect_data(self, underlying: str) -> Dict[str, Any]:
         """
@@ -65,24 +84,32 @@ class DecisionEngine:
                 options_data = {}
                 logger.warning("data_store не предоставлен, используем только исторические данные")
             
-            # Фильтруем опционы по максимальной экспирации (если есть данные)
+            # Только опционы в окне AGENT_CONFIG.max_expiration_days (сбор данных — без ограничения)
             filtered_options = {}
             underlying_price = None
-            
+            skipped_by_dte = 0
+
             for symbol, data in options_data.items():
-                # Извлекаем цену базового актива
                 if underlying_price is None:
-                    underlying_price = data.get('underlying_price')
-                
-                # Парсим символ для проверки экспирации
-                parts = symbol.split('-')
-                if len(parts) >= 2:
-                    # Можно добавить проверку days_to_expiration, но для этого нужна дата экспирации
-                    filtered_options[symbol] = data
-            
-            # Если нет данных в data_store, пытаемся получить из БД
-            if not filtered_options:
-                logger.info(f"Нет текущих данных для {underlying}, используем только исторические данные")
+                    underlying_price = data.get("underlying_price")
+
+                if not self._symbol_passes_agent_expiration_filter(symbol):
+                    skipped_by_dte += 1
+                    continue
+                filtered_options[symbol] = data
+
+            if skipped_by_dte:
+                logger.info(
+                    f"Агент {underlying}: пропущено {skipped_by_dte} опционов вне окна "
+                    f"DTE 1–{self.max_expiration_days} (в data_store — все подписки)"
+                )
+
+            if not filtered_options and options_data:
+                logger.info(
+                    f"Нет опционов {underlying} с DTE 1–{self.max_expiration_days} в data_store"
+                )
+            elif not filtered_options:
+                logger.info(f"Нет текущих данных для {underlying} в data_store")
             
             # Получаем уровни поддержки/сопротивления
             support_resistance = self.db.get_support_resistance_levels(underlying)
@@ -182,32 +209,28 @@ class DecisionEngine:
             # Формируем сводку для опционов
             options_summary = self._create_options_summary(options_data, ivr_analysis)
             
-            # GEX (Gamma Exposure) только для дневных опционов (DTE <= 3)
+            # GEX — только опционы в окне агента (DTE <= max_expiration_days)
             gex_summary = None
             try:
-                first_symbol = next(iter(options_data.keys()), None)
-                if first_symbol:
-                    parts = first_symbol.split('-')
-                    if len(parts) >= 2:
-                        expiry_str = parts[1]
-                        exp_date = parse_expiration_date(expiry_str)
-                        if exp_date:
-                            from datetime import date
-                            dte = (exp_date - date.today()).days
-                            if dte <= self.max_expiration_days:
-                                opts_for_gex = []
-                                for sym, d in options_data.items():
-                                    p = sym.split('-')
-                                    opt_type = p[3] if len(p) >= 4 else None
-                                    opts_for_gex.append({
-                                        'symbol': sym,
-                                        'open_interest': d.get('open_interest') or 0,
-                                        'gamma': d.get('gamma') or 0,
-                                        'days_to_expiration': dte,
-                                        'option_type': opt_type,
-                                    })
-                                gex_by_strike = calculate_gex_by_strike(opts_for_gex, max_dte=self.max_expiration_days)
-                                gex_summary = gex_summary_for_agent(gex_by_strike, top_n=5)
+                opts_for_gex = []
+                for sym, d in options_data.items():
+                    dte = self._get_days_to_expiration_from_symbol(sym)
+                    if dte is None or dte <= 0 or dte > self.max_expiration_days:
+                        continue
+                    p = sym.split("-")
+                    opt_type = p[3] if len(p) >= 4 else None
+                    opts_for_gex.append({
+                        "symbol": sym,
+                        "open_interest": d.get("open_interest") or 0,
+                        "gamma": d.get("gamma") or 0,
+                        "days_to_expiration": dte,
+                        "option_type": opt_type,
+                    })
+                if opts_for_gex:
+                    gex_by_strike = calculate_gex_by_strike(
+                        opts_for_gex, max_dte=self.max_expiration_days
+                    )
+                    gex_summary = gex_summary_for_agent(gex_by_strike, top_n=5)
             except Exception as gex_err:
                 logger.debug(f"GEX не рассчитан: {gex_err}")
             
@@ -300,20 +323,18 @@ class DecisionEngine:
 
     def _group_options_by_expiration(self, options_data: Dict[str, Dict]) -> List[Dict[str, Any]]:
         """
-        Группировать опционы по экспирациям, исключая days_to_expiration = 0.
+        Группировать опционы по экспирациям для агента: DTE 1..max_expiration_days.
         """
         grouped: Dict[str, Dict[str, Any]] = {}
-        today = date.today()
         for symbol, data in options_data.items():
+            if not self._symbol_passes_agent_expiration_filter(symbol):
+                continue
             parts = symbol.split('-')
             if len(parts) < 2:
                 continue
             expiration = parts[1]
-            expiration_date = self.db.parse_expiration_date(expiration)
-            if not expiration_date:
-                continue
-            days_to_expiration = (expiration_date - today).days
-            if days_to_expiration == 0:
+            days_to_expiration = self._get_days_to_expiration_from_symbol(symbol)
+            if days_to_expiration is None:
                 continue
             if expiration not in grouped:
                 grouped[expiration] = {
@@ -367,8 +388,16 @@ class DecisionEngine:
 
             grouped = self._group_options_by_expiration(collected_data.get('options_data', {}))
             if not grouped:
-                logger.info(f"Нет подходящих экспираций для анализа {underlying}")
+                logger.info(
+                    f"Нет экспираций для агента {underlying} "
+                    f"(DTE 1–{self.max_expiration_days})"
+                )
                 return results
+
+            logger.info(
+                f"Агент {underlying}: анализ {len(grouped)} экспираций "
+                f"(DTE 1–{self.max_expiration_days}, AGENT_CONFIG)"
+            )
 
             for group in grouped:
                 expiration = group["expiration"]

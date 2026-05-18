@@ -18,8 +18,15 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from config import CONFIG, SUBSCRIPTION_CONFIG, AGENT_CONFIG, format_datetime_local, DISPLAY_TIMEZONE
-from services.data_store import data_store
+from config import (
+    CONFIG,
+    SUBSCRIPTION_CONFIG,
+    AGENT_CONFIG,
+    BOT_CONFIG,
+    format_datetime_local,
+    DISPLAY_TIMEZONE,
+)
+from services.data_store import RemoteDataStore
 from core.data.database import get_database
 from core.agent.decision_engine import get_decision_engine
 from core.agent.trading_agent import get_trading_agent
@@ -37,8 +44,8 @@ from core.strategy.gex_calculator import (
 from core.strategy.entry_checklist import run_entry_checklist
 from utils.logging_config import setup_service_logging
 
-# Настройка логирования с ротацией файлов
-logger = setup_service_logging(service_name="telegram_bot", log_level=logging.DEBUG)
+# Уровень и параметры берутся из LOGGING_CONFIG / переменных окружения
+logger = setup_service_logging(service_name="telegram_bot")
 
 # Проверка загрузки DEEPSEEK_API_KEY при старте (после настройки logger)
 import os
@@ -73,6 +80,10 @@ API_SERVER_URL = os.getenv("API_SERVER_URL", "http://api-server:7000")
 LIVE_DATA_MAX_AGE_SECONDS = int(os.getenv("LIVE_DATA_MAX_AGE_SECONDS", "180"))
 THRESHOLD = 0.01  # Порог равенства цен (1%)
 CHECK_INTERVAL = 5  # Интервал проверки в секундах
+
+# Единый источник live-данных для бота — api-server (там WebSocket).
+# Локальная in-memory копия в контейнере бота не используется.
+data_store = RemoteDataStore(API_SERVER_URL)
 
 # Состояния для ConversationHandler
 (
@@ -328,7 +339,12 @@ class TelegramOptionBot:
         action = query.data
         
         # Игнорируем кнопки агента - они обрабатываются отдельным обработчиком
-        if action in ["agent_toggle", "agent_run_now"]:
+        if action in (
+            "agent_toggle",
+            "agent_start_periodic",
+            "agent_stop_periodic",
+            "agent_run_now",
+        ):
             logger.debug(f"handle_callback: игнорируем {action} (обрабатывается _handle_agent_callback)")
             return CHOOSING_ACTION
         
@@ -2235,13 +2251,20 @@ class TelegramOptionBot:
         message += f"Мин. уверенность: {AGENT_CONFIG.get('min_confidence', 0.6):.0%}\n"
         message += f"Макс. экспирация: {AGENT_CONFIG.get('max_expiration_days', 3)} дней\n"
         
+        if is_enabled:
+            periodic_button = InlineKeyboardButton(
+                "⏸ Остановить периодический анализ",
+                callback_data="agent_stop_periodic",
+            )
+        else:
+            periodic_button = InlineKeyboardButton(
+                "▶️ Запустить периодический анализ",
+                callback_data="agent_start_periodic",
+            )
         keyboard = [
-            [
-                InlineKeyboardButton("▶️ Запустить" if not is_enabled else "⏸ Остановить", 
-                                   callback_data="agent_toggle"),
-                InlineKeyboardButton("🔄 Запустить сейчас", callback_data="agent_run_now")
-            ],
-            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")]
+            [periodic_button],
+            [InlineKeyboardButton("🔄 Запустить сейчас", callback_data="agent_run_now")],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="back_to_menu")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -2534,41 +2557,43 @@ class TelegramOptionBot:
             logger.info(f"🔔 Обработка callback агента: {callback_data} (пользователь {user_id}, чат {chat_id})")
             print(f"🔔 DEBUG: _handle_agent_callback вызван с data='{callback_data}' для пользователя {user_id}")
             
-            if callback_data == "agent_toggle":
-                logger.info(f"🔄 Обработка agent_toggle для пользователя {user_id}")
-                print(f"🔄 DEBUG: agent_toggle - текущее состояние: enabled={self.agent_enabled.get(user_id, False)}")
-                if self.agent_enabled.get(user_id, False):
-                    # Останавливаем
-                    self.agent_enabled[user_id] = False
-                    if context.job_queue:
-                        current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
-                        for job in current_jobs:
-                            job.schedule_removal()
-                    logger.info(f"⏸ Агент остановлен для пользователя {user_id}")
-                    
-                    # Обновляем сообщение со статусом
-                    await self.agent_status(update, context)
+            if callback_data in ("agent_toggle", "agent_start_periodic", "agent_stop_periodic"):
+                already_on = self.agent_enabled.get(user_id, False)
+                if callback_data == "agent_start_periodic":
+                    want_on = True
+                elif callback_data == "agent_stop_periodic":
+                    want_on = False
                 else:
-                    # Запускаем
+                    want_on = not already_on  # legacy toggle
+
+                if want_on:
                     self.agent_enabled[user_id] = True
                     interval_minutes = AGENT_CONFIG.get("run_interval_minutes", 60)
                     if context.job_queue:
-                        current_jobs = context.job_queue.get_jobs_by_name(f"agent_{user_id}")
-                        for job in current_jobs:
+                        for job in context.job_queue.get_jobs_by_name(f"agent_{user_id}"):
                             job.schedule_removal()
-                        job = context.job_queue.run_repeating(
+                        context.job_queue.run_repeating(
                             self._run_agent_periodic,
                             interval=interval_minutes * 60,
                             first=10,
                             name=f"agent_{user_id}",
-                            data={'user_id': user_id, 'chat_id': chat_id}
+                            data={"user_id": user_id, "chat_id": chat_id},
                         )
-                        logger.info(f"✅ Агент запущен для пользователя {user_id}, интервал: {interval_minutes} мин")
+                        logger.info(
+                            "Периодический анализ запущен (user=%s, interval=%s мин)",
+                            user_id,
+                            interval_minutes,
+                        )
                     else:
-                        logger.error("JobQueue not available in context")
-                    
-                    # Обновляем сообщение со статусом
-                    await self.agent_status(update, context)
+                        logger.error("JobQueue недоступна в context")
+                else:
+                    self.agent_enabled[user_id] = False
+                    if context.job_queue:
+                        for job in context.job_queue.get_jobs_by_name(f"agent_{user_id}"):
+                            job.schedule_removal()
+                    logger.info("Периодический анализ остановлен (user=%s)", user_id)
+
+                await self.agent_status(update, context)
             
             elif callback_data == "agent_run_now":
                 # Запускаем анализ немедленно
@@ -3091,7 +3116,7 @@ class TelegramOptionBot:
                 CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
                 CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$"),
                 # Обработка кнопок агента из любого состояния
-                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_run_now)$")
+                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_start_periodic|agent_stop_periodic|agent_run_now)$")
             ]
         )
         
@@ -3112,7 +3137,7 @@ class TelegramOptionBot:
                 CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
                 CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$"),
                 # Обработка кнопок агента из любого состояния
-                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_run_now)$")
+                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_start_periodic|agent_stop_periodic|agent_run_now)$")
             ]
         )
         
@@ -3154,7 +3179,7 @@ class TelegramOptionBot:
                 CallbackQueryHandler(self.cancel_operation, pattern="^cancel$"),
                 CallbackQueryHandler(self.back_to_main_menu, pattern="^back_to_menu$"),
                 # Обработка кнопок агента из любого состояния
-                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_run_now)$")
+                CallbackQueryHandler(self._handle_agent_callback, pattern="^(agent_toggle|agent_start_periodic|agent_stop_periodic|agent_run_now)$")
             ]
         )
 
@@ -3240,7 +3265,7 @@ class TelegramOptionBot:
         # Обработчик callback для кнопок агента (должен быть первым, чтобы не перехватывался общим обработчиком)
         agent_callback_handler = CallbackQueryHandler(
             self._handle_agent_callback,
-            pattern="^(agent_toggle|agent_run_now)$"
+            pattern="^(agent_toggle|agent_start_periodic|agent_stop_periodic|agent_run_now)$"
         )
         application.add_handler(agent_callback_handler)
         logger.info("✅ Обработчик кнопок агента зарегистрирован (agent_toggle, agent_run_now)")
@@ -3260,11 +3285,45 @@ class TelegramOptionBot:
             ])
         application.post_init = set_bot_commands
 
-        # Запускаем бота
-        logger.info("Бот запущен...")
+        # Запускаем бота: режим выбирается через BOT_CONFIG (config.py)
+        mode = (BOT_CONFIG.get("mode") or "polling").lower()
+        drop_pending = bool(BOT_CONFIG.get("drop_pending_updates", True))
+
+        if mode == "webhook":
+            webhook_url = BOT_CONFIG.get("webhook_url") or ""
+            webhook_path = BOT_CONFIG.get("webhook_path") or "/telegram-webhook"
+            listen = BOT_CONFIG.get("webhook_listen") or "0.0.0.0"
+            port = int(BOT_CONFIG.get("webhook_port") or 8443)
+            secret = BOT_CONFIG.get("webhook_secret_token") or None
+            if not webhook_url:
+                logger.error(
+                    "BOT_MODE=webhook, но WEBHOOK_URL не задан в .env. Откат к polling."
+                )
+                mode = "polling"
+            else:
+                full_webhook_url = f"{webhook_url.rstrip('/')}{webhook_path}"
+                logger.info(
+                    "Бот запущен в режиме webhook: %s (listen=%s:%s, secret=%s)",
+                    full_webhook_url,
+                    listen,
+                    port,
+                    "set" if secret else "none",
+                )
+                application.run_webhook(
+                    listen=listen,
+                    port=port,
+                    url_path=webhook_path.lstrip("/"),
+                    webhook_url=full_webhook_url,
+                    secret_token=secret,
+                    drop_pending_updates=drop_pending,
+                    allowed_updates=Update.ALL_TYPES,
+                )
+                return
+
+        logger.info("Бот запущен в режиме polling")
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
+            drop_pending_updates=drop_pending,
         )
 
 
