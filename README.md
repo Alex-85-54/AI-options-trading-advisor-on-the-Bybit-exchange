@@ -104,11 +104,3 @@ Bybit WebSocket → data_store → API / Telegram / SQLite
 ## Стек
 
 Python 3.12 · FastAPI · python-telegram-bot · pybit · SQLite · pandas · DeepSeek API · Docker · uv
-
-## Автор
-
-**Aleksandr Egorov** — дипломный проект.
-
-## Лицензия
-
-MIT (или уточните требования курса).

@@ -68,7 +68,7 @@ STRATEGY_CONFIG = {
 
 # Конфигурация динамических порогов (рассчитываются по истории в БД)
 DYNAMIC_THRESHOLD_CONFIG = {
-    "enabled": True,
+    "enabled": False,
     "lookback_days": 7,                  # Окно истории для расчета
     "recalc_interval_hours": 24,          # Переcчет не чаще чем раз в N часов
     "min_sample_size": 50,                # Минимум точек для расчета (иначе fallback на STRATEGY_CONFIG)
